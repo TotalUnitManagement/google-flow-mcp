@@ -81,7 +81,7 @@ server.registerTool(
   async ({ duration_seconds, navigate }) => {
     try {
       const report = await discoverApi(duration_seconds * 1000, navigate);
-      return ok(formatReport(report), { requestsSeen: report.requestsSeen, endpoints: report.endpoints.length });
+      return ok(formatReport(report), { ...report });
     } catch (err) {
       return fail(err);
     }
@@ -126,12 +126,13 @@ server.registerTool(
       if (endpoints.length === 0) {
         return ok("No endpoints learned yet. Run flow_discover_api first.");
       }
-      if (response_format === "json") return ok(JSON.stringify(map, null, 2), { count: endpoints.length });
+      if (response_format === "json") return ok(JSON.stringify(map, null, 2), { count: endpoints.length, ...map });
       const lines = endpoints.map(
         (e) => `${e.method.padEnd(4)} ${e.procedure}${e.httpSafe ? "  [http-safe]" : ""}  (seen ${e.sampleCount}x)`,
       );
       return ok(`Learned ${endpoints.length} endpoints, last updated ${map.discoveredAt}:\n\n${lines.join("\n")}`, {
         count: endpoints.length,
+        ...map,
       });
     } catch (err) {
       return fail(err);
@@ -468,7 +469,7 @@ server.registerTool(
     try {
       const entries = await readLedger(limit);
       if (entries.length === 0) return ok("Ledger is empty — no generations recorded yet.");
-      if (response_format === "json") return ok(JSON.stringify(entries, null, 2), { count: entries.length });
+      if (response_format === "json") return ok(JSON.stringify(entries, null, 2), { count: entries.length, entries });
       const totalCharged = entries.reduce((sum, e) => sum + e.charged, 0);
       const lines = entries.map(
         (e) =>
@@ -477,6 +478,7 @@ server.registerTool(
       return ok(`Last ${entries.length} entries (${totalCharged} credits charged):\n\n${lines.join("\n")}`, {
         count: entries.length,
         totalCharged,
+        entries,
       });
     } catch (err) {
       return fail(err);
@@ -636,9 +638,13 @@ server.registerTool(
     try {
       const projects = await listProjects();
       if (projects.length === 0)
-        return ok("No project links visible. Navigate to labs.google/fx/tools/flow in the attached browser.");
-      if (response_format === "json") return ok(JSON.stringify(projects, null, 2), { count: projects.length });
-      return ok(projects.map((p) => `${p.projectId}  ${p.name ?? "(unnamed)"}`).join("\n"), { count: projects.length });
+        return ok("No project links visible. Navigate to flow.google.com in the attached browser.");
+      if (response_format === "json")
+        return ok(JSON.stringify(projects, null, 2), { count: projects.length, projects });
+      return ok(projects.map((p) => `${p.projectId}  ${p.name ?? "(unnamed)"}`).join("\n"), {
+        count: projects.length,
+        projects,
+      });
     } catch (err) {
       return fail(err);
     }
@@ -746,11 +752,11 @@ server.registerTool(
     try {
       const apps = await listApps();
       if (apps.length === 0) return ok("No apps detected. Open a project and navigate to its Tools tab.");
-      if (response_format === "json") return ok(JSON.stringify(apps, null, 2), { count: apps.length });
+      if (response_format === "json") return ok(JSON.stringify(apps, null, 2), { count: apps.length, apps });
       const lines = apps.map((a) => `${a.name}${a.description ? ` — ${a.description.slice(0, 80)}` : ""}`);
       return ok(
         `${apps.length} app(s):\n${lines.join("\n")}\n\nNone of these quote a cost. Prefer local ffmpeg for concatenation and resizing; reserve Flow apps for things you cannot reproduce locally.`,
-        { count: apps.length },
+        { count: apps.length, apps },
       );
     } catch (err) {
       return fail(err);
