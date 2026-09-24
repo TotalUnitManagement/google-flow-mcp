@@ -129,6 +129,10 @@ Flow moved from `labs.google/fx/tools/flow` (Next.js + tRPC) to `flow.google.com
 paths and `/fx/api/auth/session` are gone.
 
 - **Project URL:** `https://flow.google.com/project/<uuid>`.
+- **Credit balance:** click the One Google avatar (`[aria-label^="Google Account:"]`)
+  to open `flow-account-panel`; `.credits-count` reads "N Google Flow credits". The
+  panel is only in the DOM while open, Escape does not close it, and it also holds
+  "Sign out of all accounts" — close it with `button[aria-label="Close account panel"]`.
 - **Projects grid:** `flow-project-card` per project. The link is a thumbnail
   (`a.project-thumbnail-container`, `aria-label="Open project"` on every card); the
   title is the text node of `.project-title-label`, which also holds the "Edit

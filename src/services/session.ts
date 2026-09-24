@@ -65,30 +65,56 @@ export function extractProjectId(url: string): string | null {
   return /\/project\/([A-Za-z0-9_-]+)/.exec(url)?.[1] ?? null;
 }
 
+/** @internal exported for unit tests. Pulls a balance out of credit-shaped text. */
+export function parseCredits(text: string): number | null {
+  // Never a bare "N credits": the composer's "Generating will use N credits" quote
+  // would read as a balance and defeat the affordability check.
+  const patterns = [/([\d,]+)\s+Google\s+Flow\s+credits?\b/i, /([\d,]+)\s*credits?\s*(?:remaining|left|available)/i];
+  for (const p of patterns) {
+    const m = p.exec(text);
+    if (m) {
+      const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
 /**
- * Credit balance. It lives behind the avatar menu rather than on the main screen,
- * so the DOM sweep is a best-effort scan for a credits-shaped number anywhere in
- * the rendered text. Returns null rather than guessing — callers treat an unknown
+ * Credit balance. On flow.google.com it lives in the account panel behind the One
+ * Google avatar ("50 Google Flow credits"), which is only in the DOM while open —
+ * so open it, read it, close it. The panel also holds "Sign out of all accounts",
+ * so it is closed by its exact aria-label, never by text. Falls back to scanning
+ * the visible page. Returns null rather than guessing — callers treat an unknown
  * balance as "cannot verify budget" rather than "budget is fine".
  */
 export async function readCredits(): Promise<number | null> {
   try {
-    const text = await pageText();
-    const patterns = [
-      /([\d,]+)\s*credits?\s*(?:remaining|left|available)/i,
-      /credits?\s*(?:remaining|left|available)?\s*[:•]?\s*([\d,]+)/i,
-    ];
-    for (const p of patterns) {
-      const m = p.exec(text);
-      if (m) {
-        const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
-        if (Number.isFinite(n)) return n;
+    const page = await getFlowPage();
+    const panel = "flow-account-panel";
+    const alreadyOpen = (await page.locator(panel).count()) > 0;
+    if (!alreadyOpen) await page.locator('[aria-label^="Google Account:"]').first().click({ timeout: 5_000 });
+    try {
+      const count = page.locator(`${panel} .credits-count`).first();
+      await count.waitFor({ state: "visible", timeout: 5_000 });
+      const n = parseCredits((await count.textContent()) ?? "");
+      if (n !== null) return n;
+    } finally {
+      if (!alreadyOpen) {
+        await page
+          .locator(`${panel} button[aria-label="Close account panel"]`)
+          .click({ timeout: 3_000 })
+          .catch(() => undefined);
       }
     }
   } catch {
-    /* unknown */
+    /* fall through to the page-text scan */
   }
-  return null;
+  try {
+    return parseCredits(await pageText());
+  } catch {
+    return null;
+  }
 }
 
 /**
