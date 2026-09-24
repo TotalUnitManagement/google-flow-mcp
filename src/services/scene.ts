@@ -4,7 +4,7 @@ import { config } from "../config.js";
 import { KNOWN_PROCEDURES, MIN_MEDIA_BYTES, TIMEOUTS } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
-import { openVideoEditor, videoToken } from "./media.js";
+import { openVideoEditor } from "./media.js";
 import { clickByText } from "./transport.js";
 
 /**
@@ -264,7 +264,7 @@ export async function addClipsToScene(mediaIds: string[]): Promise<{ added: stri
         option.click();
         return true;
       },
-      { id: mediaId, token: videoToken(mediaId) },
+      { id: mediaId, token: null as string | null },
     );
 
     if (!picked) {
