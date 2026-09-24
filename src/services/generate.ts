@@ -373,40 +373,34 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
 }
 
 /**
- * A send that produced no media. The balance is the ground truth: if it has not
- * moved and nothing is still rendering, Flow never started the job (seen live: a
- * Frames send cleared the prompt box, charged nothing, produced nothing), so the
- * run budget is refunded. Anything else is recorded as charged and possibly still
- * rendering. Either way it reaches the ledger, which it previously never did.
+ * A send that produced no media within the timeout. It is ALWAYS recorded as
+ * charged and possibly still rendering — never refunded.
+ *
+ * An unchanged balance is NOT evidence that nothing started: Flow debits when a
+ * clip finishes, not when it is sent. Seen live 2026-09-24: a Frames send timed
+ * out at 480s with the balance unchanged and no progress tile in the server's
+ * grid, then finished later as a new clip and the balance dropped by 4. A
+ * refund there would have let the budget undercount real spend. The balance is
+ * recorded so a later flow_check_session can reconcile.
  */
 async function settleTimeout(
   err: Error,
   ctx: { opts: GenerateOptions; charged: number; balanceBefore: number | null },
 ): Promise<void> {
-  const kind = ctx.opts.free ? "still" : "video";
   try {
-    const page = await getFlowPage();
-    const rendering = await page.evaluate(() =>
-      [...document.querySelectorAll<HTMLElement>("flow-grid-tile-container")].some((t) =>
-        /\b\d{1,3}%/.test(t.innerText),
-      ),
-    );
     const balanceAfter = await readCredits();
-    const neverStarted =
-      ctx.charged > 0 && !rendering && ctx.balanceBefore !== null && balanceAfter === ctx.balanceBefore;
-    if (neverStarted) {
-      await recordSpend(-ctx.charged);
-      err.message += ` The balance is unchanged at ${balanceAfter} and nothing is rendering, so Flow never started it: nothing was charged, and the run budget was refunded.`;
+    if (ctx.balanceBefore !== null && balanceAfter === ctx.balanceBefore) {
+      err.message += ` The balance is still ${balanceAfter}; Flow debits on completion, so this can still finish and charge. Check the grid later with flow_list_media or flow_collect.`;
     }
     await log({
-      kind,
+      kind: ctx.opts.free ? "still" : "video",
       opts: ctx.opts,
       quoted: ctx.charged,
-      charged: neverStarted ? 0 : ctx.charged,
+      charged: ctx.charged,
       balance: balanceAfter,
-      verdict: neverStarted ? "rejected" : "in_flight",
+      verdict: "in_flight",
       files: [],
-      note: neverStarted ? "sent but never started (balance unchanged)" : "timed out waiting for media",
+      note: "timed out waiting for media; counted as charged",
     });
   } catch {
     /* the original timeout error is what the caller needs */
