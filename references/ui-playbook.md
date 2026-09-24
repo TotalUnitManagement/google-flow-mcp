@@ -150,9 +150,11 @@ paths and `/fx/api/auth/session` are gone.
 - **Observed prices:** Nano Banana 2 Lite stills 0; Veo 3.1 Lite 10, Fast 20
   (fixed 8s, x1); Omni 1.1 Flash 8s x1 6 at 360p, 12 at 720p.
 - **Frames:** `button.empty-chip` "Start" / "End" open a "Select a frame image"
-  dialog: `[role=option]` buttons whose `<img>` src is
-  `https://flow-content.google/image/<id>?Expires=…`, then "Add to prompt". The
-  same dialog has "Upload media" (file chooser).
+  dialog: `[role=option]` buttons (`.asset-item`), then "Add to prompt". The same
+  dialog has "Upload media" (file chooser). **The options carry no media id**
+  (observed 2026-09-24): each `<img>` src is `lh3.googleusercontent.com/asb/<token>=…`.
+  The grid's `[data-media-id]` img serves the same `<token>` from
+  `flow.google.com/asb/<token>=…`, so map id → token from the grid and match by token.
 - **Grid:** each tile is `flow-grid-tile-container` holding an element with
   `data-media-id`; its src is a signed `flow-content.google` url that downloads
   without cookies. Rendering tiles show a `NN%` label.
