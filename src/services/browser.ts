@@ -15,9 +15,20 @@ let mode: "cdp-attach" | "launched" | "none" = "none";
  * the human owns the login, we borrow the tab. `launchPersistentContext` is the
  * fallback for a headless box, and requires a one-time interactive login.
  */
+let connecting: Promise<BrowserContext> | null = null;
+
 export async function getContext(): Promise<BrowserContext> {
   if (context && isAlive()) return context;
+  // MCP clients may call tools in parallel. Two concurrent launches on one persistent
+  // profile race, and the loser fails with "profile is already in use" — so every
+  // caller shares the one in-flight connect.
+  connecting ??= connect().finally(() => {
+    connecting = null;
+  });
+  return connecting;
+}
 
+async function connect(): Promise<BrowserContext> {
   if (config.cdpUrl) {
     try {
       browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: 10_000 });
