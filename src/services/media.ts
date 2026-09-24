@@ -171,46 +171,39 @@ async function openVideoTile(key: string, stay = false): Promise<{ mediaId: stri
     throw new FlowError(`No video tile matches ${key} any more.`, "Open the project's All media view and retry.");
   }
 
-  // Playwright sees the request even when resource timing does not; resource
-  // timing and the player cover the rest. Only activity after the click counts,
-  // so an earlier clip never matches.
+  // The editor does not load the clip on open, nor on Play (it decodes off the
+  // main thread; observed 2026-09-24). What reliably fetches it is the editor's
+  // own Download media -> "Original size", which for a single clip is the clip
+  // file itself: a flow-content.google/video/<id> request and a browser
+  // download of that url. Read the url from either and cancel the download.
+  await page.waitForURL(/\/edit\//, { timeout: 20_000 }).catch(() => undefined);
   let url: string | null = null;
   const onRequest = (r: import("playwright-core").Request) => {
     if (!url && re.test(r.url())) url = r.url();
   };
+  let downloadSeen = false;
+  // Handles exactly the one download this lookup triggers, then detaches, so it
+  // can never cancel a later, real export.
+  const onDownload = (d: import("playwright-core").Download) => {
+    page.off("download", onDownload);
+    downloadSeen = true;
+    if (!url && re.test(d.url())) url = d.url();
+    d.cancel().catch(() => undefined);
+  };
   page.on("request", onRequest);
+  page.on("download", onDownload);
   try {
-    for (let attempt = 0; attempt < 2 && !url; attempt++) {
-      if (attempt === 1) {
-        // A memory-cache hit fires nothing; a reload of the editor re-requests.
-        await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => null);
-        mark = 0;
-      }
-      const deadline = Date.now() + 12_000;
-      while (!url && Date.now() < deadline) {
-        await page.waitForTimeout(400);
-        const seen = await page
-          .evaluate((m) => {
-            const rx = /flow-content\.google\/video\/[0-9a-f-]{36}/;
-            const fresh = performance
-              .getEntriesByType("resource")
-              .slice(m)
-              .map((e) => e.name)
-              .find((n) => rx.test(n));
-            if (fresh) return fresh;
-            return (
-              [...document.querySelectorAll<HTMLVideoElement>("video")]
-                .map((v) => v.currentSrc || v.src)
-                .find((s) => rx.test(s)) ?? null
-            );
-          }, mark)
-          .catch(() => null);
-        url = url ?? seen;
-      }
-    }
+    await page.waitForTimeout(1_500); // let the editor's toolbar settle
+    await chooseOriginalSize();
+    const deadline = Date.now() + 20_000;
+    while (!url && Date.now() < deadline) await page.waitForTimeout(300);
+    // The request can win the race; give its download a moment to arrive and be cancelled.
+    for (let i = 0; i < 10 && !downloadSeen; i++) await page.waitForTimeout(300);
   } finally {
     page.off("request", onRequest);
+    page.off("download", onDownload);
   }
+  void mark;
 
   const editUrl = page.url();
   if (!stay && page.url() !== gridUrl) {
@@ -228,6 +221,45 @@ async function openVideoTile(key: string, stay = false): Promise<{ mediaId: stri
   }
   videoTiles.set(key, { mediaId, url });
   return { mediaId, url, editUrl };
+}
+
+/** Open the editor's top-bar "Download media" menu and pick "Original size". Free. */
+export async function chooseOriginalSize(): Promise<void> {
+  const page = await getFlowPage();
+  const opened = await page.evaluate(() => {
+    const trigger = [...document.querySelectorAll<HTMLElement>('button[aria-label="Download media"]')].find(
+      (b) => b.getClientRects().length > 0 && !b.closest(".cdk-overlay-container"),
+    );
+    if (!trigger) return false;
+    trigger.click();
+    return true;
+  });
+  if (!opened) {
+    throw new FlowError(
+      'Could not find the editor\'s "Download media" menu.',
+      "Flow's editor may have changed — see references/ui-playbook.md. Nothing was charged.",
+    );
+  }
+  await page.waitForTimeout(800);
+  const picked = await page.evaluate(() => {
+    const item = [
+      ...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane [role=menuitem], .cdk-overlay-pane button"),
+    ]
+      .filter((e) => e.getClientRects().length > 0)
+      .find((e) => /Original size/i.test(e.innerText) && e.getAttribute("aria-disabled") !== "true");
+    if (!item) {
+      document.querySelector<HTMLElement>(".cdk-overlay-backdrop")?.click();
+      return false;
+    }
+    item.click();
+    return true;
+  });
+  if (!picked) {
+    throw new FlowError(
+      'The Download menu had no enabled "Original size" option.',
+      "Nothing was downloaded or charged. Check the menu in the browser.",
+    );
+  }
 }
 
 /**

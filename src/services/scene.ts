@@ -4,7 +4,7 @@ import { config } from "../config.js";
 import { KNOWN_PROCEDURES, MIN_MEDIA_BYTES, TIMEOUTS } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
-import { openVideoEditor } from "./media.js";
+import { chooseOriginalSize, openVideoEditor } from "./media.js";
 import { clickByText } from "./transport.js";
 
 /**
@@ -105,45 +105,6 @@ export async function exportScene(
     return { file: target, bytes: buffer.length, via };
   } finally {
     page.off("request", onRequest);
-  }
-}
-
-/** Open the editor's top-bar "Download media" menu and pick "Original size". Free. */
-async function chooseOriginalSize(): Promise<void> {
-  const page = await getFlowPage();
-  const opened = await page.evaluate(() => {
-    const trigger = [...document.querySelectorAll<HTMLElement>('button[aria-label="Download media"]')].find(
-      (b) => b.getClientRects().length > 0 && !b.closest(".cdk-overlay-container"),
-    );
-    if (!trigger) return false;
-    trigger.click();
-    return true;
-  });
-  if (!opened) {
-    throw new FlowError(
-      'Could not find the editor\'s "Download media" menu.',
-      "Flow's editor may have changed — see references/ui-playbook.md. Nothing was charged.",
-    );
-  }
-  await page.waitForTimeout(800);
-  const picked = await page.evaluate(() => {
-    const item = [
-      ...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane [role=menuitem], .cdk-overlay-pane button"),
-    ]
-      .filter((e) => e.getClientRects().length > 0)
-      .find((e) => /Original size/i.test(e.innerText) && e.getAttribute("aria-disabled") !== "true");
-    if (!item) {
-      document.querySelector<HTMLElement>(".cdk-overlay-backdrop")?.click();
-      return false;
-    }
-    item.click();
-    return true;
-  });
-  if (!picked) {
-    throw new FlowError(
-      'The Download menu had no enabled "Original size" option.',
-      "Nothing was downloaded or charged. Check the menu in the browser.",
-    );
   }
 }
 
