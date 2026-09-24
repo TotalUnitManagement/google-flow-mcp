@@ -407,10 +407,30 @@ export async function attachFrames(
       continue;
     }
     await page.waitForTimeout(400);
-    const added = await clickByText("Add to prompt", { exact: true, maxDescendants: 3 });
-    if (!added) {
-      await closePicker();
-      throw new FlowError(`Selected ${id} but could not press "Add to prompt".`, "Nothing was charged.");
+    // On flow.google.com (observed 2026-09-24) choosing an option attaches it and
+    // closes the picker; there is no "Add to prompt" step. Only look for that
+    // button while the picker is still open, and only inside it — a page-wide
+    // text match clicked some unrelated element here.
+    const pickerOpen = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane,[role=dialog]")].some((p) =>
+        /Select a frame image/i.test(p.innerText),
+      ),
+    );
+    if (pickerOpen) {
+      const added = await page.evaluate(() => {
+        const pane = [...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane,[role=dialog]")].find((p) =>
+          /Select a frame image/i.test(p.innerText),
+        );
+        const btn = [...(pane?.querySelectorAll<HTMLElement>("button") ?? [])].find(
+          (b) => b.innerText.replace(/\s+/g, " ").trim() === "Add to prompt",
+        );
+        btn?.click();
+        return !!btn;
+      });
+      if (!added) {
+        await closePicker();
+        throw new FlowError(`Selected ${id} but could not press "Add to prompt".`, "Nothing was charged.");
+      }
     }
     await page.waitForTimeout(900);
     attached.push(id);
