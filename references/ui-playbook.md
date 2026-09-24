@@ -158,6 +158,18 @@ paths and `/fx/api/auth/session` are gone.
 - **Grid:** each tile is `flow-grid-tile-container` holding an element with
   `data-media-id`; its src is a signed `flow-content.google` url that downloads
   without cookies. Rendering tiles show a `NN%` label.
+- **Video tiles** (observed 2026-09-24): `flow-video-tile` holding
+  `img.thumbnail` (an `/asb/` token url) and a `.resolution-badge` ("360p"). **No
+  `data-media-id` anywhere in the tile**, so grid scans that key on it see only
+  images. The video bytes come from `flow-content.google/video/<uuid>?…` (signed).
+- **Opening a video** routes to `/project/<p>/edit/<uuid>` — and that uuid is
+  **not** the video's CDN id (observed: edit `6684f218…`, video `270ee87c…`). The
+  view is a scene editor: "Done editing scene", "Add clip", "Skip to next clip",
+  timeline zoom. Scenes are no longer created from a "+" menu; the top-bar "+"
+  holds only Upload / New collection / Create character.
+- **Scene download:** the editor's "Download" menu offers "270p Animated GIF",
+  "360p Original size", "720p Upscaled" (disabled on a 360p clip). There is also a
+  per-media "Download media" button. The network shape of either is unrecorded.
 - **Agent settings** (session panel → tune icon) hold "Confirm before generating"
   (Always/Never). It only governs Agent mode.
 - **Pitfall:** typing while the prompt box is not focused triggers grid shortcuts
