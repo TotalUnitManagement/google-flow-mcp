@@ -167,9 +167,15 @@ paths and `/fx/api/auth/session` are gone.
   view is a scene editor: "Done editing scene", "Add clip", "Skip to next clip",
   timeline zoom. Scenes are no longer created from a "+" menu; the top-bar "+"
   holds only Upload / New collection / Create character.
-- **Scene download:** the editor's "Download" menu offers "270p Animated GIF",
-  "360p Original size", "720p Upscaled" (disabled on a 360p clip). There is also a
-  per-media "Download media" button. The network shape of either is unrecorded.
+- **Scene download:** in the editor, the top-bar "Download media" (a
+  `mat-mdc-menu-trigger`) and each history card's "Download" open the same menu:
+  "270p Animated GIF", "360p Original size", "720p Upscaled" (disabled on a 360p
+  clip). On a **one-clip** scene, "360p Original size" fires one batchexecute
+  (`rpcids=WuwhI`) then GETs `flow-content.google/video/<clip id>?Expires…` — the
+  clip file itself, no stitch job. A multi-clip export is still unobserved.
+- **⚠️ Timeline "+"** (`aria-label="Add clip"`) opens a popover with exactly two
+  items: "Add clip" and **"Extend (Veo 3.1 - Lite)" — charged**. Never navigate it
+  with arrow keys; click the item whose whole label is "Add clip" and nothing else.
 - **Agent settings** (session panel → tune icon) hold "Confirm before generating"
   (Always/Never). It only governs Agent mode.
 - **Pitfall:** typing while the prompt box is not focused triggers grid shortcuts

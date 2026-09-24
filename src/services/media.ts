@@ -12,20 +12,65 @@ import { getFlowPage, reloadSession } from "./browser.js";
  */
 
 /**
+ * Video tiles on flow.google.com carry no media id: only a thumbnail served from
+ * /asb/<token>. Opening one routes to /project/<p>/edit/<uuid> (a scene id, not
+ * the clip's) and loads the clip from flow-content.google/video/<mediaId>?…, so
+ * that request is where the id comes from. Tokens are stable per clip, so each
+ * tile is opened at most once per server run.
+ */
+const videoTiles = new Map<string, { mediaId: string; url: string }>();
+
+interface GridEntry {
+  mediaId: string | null;
+  token: string | null;
+  kind: "image" | "video";
+  name: string | null;
+  thumbnailUrl: string | null;
+}
+
+/**
  * Enumerate the project library from the grid DOM.
  *
- * On flow.google.com every grid tile carries `data-media-id` on its <img> or
- * <video>, and that element's src is a signed flow-content.google url
- * (/image/<id> or /video/<id>). Tiles inside overlays (the frame picker) are
- * skipped so a picker never inflates the library. A tile still rendering has no
- * loaded source yet and is left out, so "new media appeared" means "finished".
+ * Images (and legacy video tiles) carry `data-media-id` on the element whose src
+ * is the media. Id-less `flow-video-tile`s are keyed by thumbnail token and
+ * resolved by opening them. Tiles inside overlays (the frame picker) are skipped
+ * so a picker never inflates the library. A tile still rendering (an `NN%` label,
+ * or no loaded source yet) is left out, so "new media appeared" means "finished".
  */
 export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaItem[]; total: number }> {
   const page = await getFlowPage();
-  const all = await page.evaluate(() => {
-    const seen = new Map<string, { mediaId: string; kind: string; name: string | null; thumbnailUrl: string | null }>();
-    for (const el of document.querySelectorAll<HTMLElement>("[data-media-id]")) {
+  const entries: GridEntry[] = await page.evaluate(() => {
+    const out: {
+      mediaId: string | null;
+      token: string | null;
+      kind: "image" | "video";
+      name: string | null;
+      thumbnailUrl: string | null;
+    }[] = [];
+    const seen = new Set<string>();
+    // Combined selectors come back in document order, so grid order is kept.
+    for (const el of document.querySelectorAll<HTMLElement>("[data-media-id], flow-video-tile")) {
       if (el.closest(".cdk-overlay-container")) continue;
+      const tile = el.closest("flow-grid-tile-container,[role=listitem],li,article") as HTMLElement | null;
+
+      if (el.tagName.toLowerCase() === "flow-video-tile") {
+        if (el.querySelector("[data-media-id]")) continue; // handled by its own element
+        if (/\b\d{1,3}%/.test(tile?.innerText ?? el.innerText)) continue; // still rendering
+        const img = el.querySelector<HTMLImageElement>("img.thumbnail");
+        if (!img || !img.complete || img.naturalWidth === 0) continue;
+        const token = /\/asb\/([^=?/]+)/.exec(img.src)?.[1] ?? null;
+        if (!token || seen.has(`t:${token}`)) continue;
+        seen.add(`t:${token}`);
+        out.push({
+          mediaId: null,
+          token,
+          kind: "video",
+          name: tile?.getAttribute("aria-label") ?? null,
+          thumbnailUrl: img.currentSrc || img.src,
+        });
+        continue;
+      }
+
       const id = el.getAttribute("data-media-id");
       if (!id || seen.has(id)) continue;
       const src =
@@ -37,29 +82,109 @@ export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaI
               : ""
             : "";
       if (!src) continue;
-      const tile = el.closest("flow-grid-tile-container,[role=listitem],li,article") as HTMLElement | null;
+      seen.add(id);
       const isVideo = el instanceof HTMLVideoElement || /\/video\//.test(src) || !!tile?.querySelector("video");
-      seen.set(id, {
+      out.push({
         mediaId: id,
+        token: null,
         kind: isVideo ? "video" : "image",
         name: el.getAttribute("alt") ?? tile?.getAttribute("aria-label") ?? null,
         thumbnailUrl: src,
       });
     }
-    return [...seen.values()];
+    return out;
   });
 
-  const items = all.slice(offset, offset + limit).map((i) => ({ ...i, kind: i.kind as MediaItem["kind"] }));
-  return { items, total: all.length };
+  const items: MediaItem[] = [];
+  for (const e of entries.slice(offset, offset + limit)) {
+    let mediaId = e.mediaId;
+    if (!mediaId && e.token) {
+      mediaId = (videoTiles.get(e.token) ?? (await openVideoTile(e.token).catch(() => null)))?.mediaId ?? null;
+    }
+    if (!mediaId) continue; // could not resolve this tile; leave it out rather than guess
+    items.push({ mediaId, kind: e.kind, name: e.name, thumbnailUrl: e.thumbnailUrl });
+  }
+  return { items, total: entries.length };
+}
+
+/**
+ * Open a video tile by thumbnail token, read the clip's id and signed url from the
+ * flow-content.google/video request it triggers, then return to the grid. Free:
+ * viewing a clip generates nothing. Never touches the editor's controls.
+ */
+async function openVideoTile(token: string): Promise<{ mediaId: string; url: string }> {
+  const page = await getFlowPage();
+  const gridUrl = page.url();
+
+  const clicked = await page.evaluate((t) => {
+    const img = [...document.querySelectorAll<HTMLImageElement>("flow-video-tile img.thumbnail")].find(
+      (i) => !i.closest(".cdk-overlay-container") && /\/asb\/([^=?/]+)/.exec(i.src)?.[1] === t,
+    );
+    if (!img) return null;
+    const mark = performance.getEntriesByType("resource").length;
+    img.click();
+    return mark;
+  }, token);
+  if (clicked === null) {
+    throw new FlowError("That video tile is no longer in the grid.", "Open the project's All media view and retry.");
+  }
+
+  // The request may be served from cache, so read resource timings and the player
+  // too; only entries recorded after the click count, so an earlier clip never matches.
+  let url: string | null = null;
+  const deadline = Date.now() + 20_000;
+  while (!url && Date.now() < deadline) {
+    await page.waitForTimeout(400);
+    url = await page
+      .evaluate((mark) => {
+        const re = /flow-content\.google\/video\/[0-9a-f-]{36}/;
+        const fresh = performance
+          .getEntriesByType("resource")
+          .slice(mark)
+          .map((e) => e.name)
+          .find((n) => re.test(n));
+        if (fresh) return fresh;
+        const player = [...document.querySelectorAll<HTMLVideoElement>("video")]
+          .map((v) => v.currentSrc || v.src)
+          .find((s) => re.test(s));
+        return player ?? null;
+      }, clicked)
+      .catch(() => null);
+  }
+
+  if (page.url() !== gridUrl) {
+    await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
+    if (page.url() !== gridUrl) await page.goto(gridUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
+  }
+
+  const mediaId = url ? /\/video\/([0-9a-f-]{36})/.exec(url)?.[1] : undefined;
+  if (!url || !mediaId) {
+    throw new FlowError(
+      "Opened the video but never saw its flow-content.google/video request.",
+      "Nothing was charged. Flow's player may have changed; see references/ui-playbook.md.",
+    );
+  }
+  const resolved = { mediaId, url };
+  videoTiles.set(token, resolved);
+  return resolved;
 }
 
 /**
  * Resolve a media id to its signed, time-limited CDN url, read from the tile the
  * grid already rendered. For a video tile the <video> source is preferred over a
- * poster image, so a thumbnail is never saved in place of the clip.
+ * poster image, so a thumbnail is never saved in place of the clip. Id-less video
+ * tiles are re-opened for a fresh url, since the one cached may have expired.
  */
 export async function resolveMediaUrl(mediaId: string): Promise<string> {
   const page = await getFlowPage();
+  const token = [...videoTiles.entries()].find(([, v]) => v.mediaId === mediaId)?.[0];
+  if (token) {
+    const fresh = await openVideoTile(token).catch(() => null);
+    const url = fresh?.url ?? videoTiles.get(token)?.url;
+    if (url) return url;
+  }
+
   const url = await page.evaluate((id) => {
     const els = [...document.querySelectorAll<HTMLElement>(`[data-media-id="${CSS.escape(id)}"]`)].filter(
       (e) => !e.closest(".cdk-overlay-container"),
@@ -75,6 +200,13 @@ export async function resolveMediaUrl(mediaId: string): Promise<string> {
   }, mediaId);
 
   if (url && /^https?:\/\//.test(url)) return url;
+
+  // An id-less video tile this run has not opened yet: listing opens each one.
+  if (!token) {
+    await listMedia(500, 0);
+    const opened = [...videoTiles.values()].find((v) => v.mediaId === mediaId);
+    if (opened) return opened.url;
+  }
 
   throw new FlowError(
     `Could not find a rendered tile with a source url for media ${mediaId}.`,

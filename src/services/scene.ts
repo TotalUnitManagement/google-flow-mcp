@@ -199,15 +199,21 @@ export async function addClipsToScene(mediaIds: string[]): Promise<{ added: stri
   return { added, failed };
 }
 
-/** The timeline "+" popover ignores synthetic clicks; arrow-key navigation works. */
+/**
+ * Open the timeline "+" popover and choose "Add clip" BY EXACT LABEL.
+ *
+ * On flow.google.com (observed 2026-09-24) the popover holds exactly two items:
+ * "Add clip" and "Extend (Veo 3.1 - Lite)" — the charged one. This used to press
+ * ArrowDown + Enter blind; if focus started on the first item, that lands on
+ * Extend and charges. Now it clicks only an item whose whole label is "Add clip",
+ * rejects anything mentioning Extend, and backs out when neither matches.
+ */
 async function openTimelinePopover(): Promise<boolean> {
   const page = await getFlowPage();
   const opened = await page.evaluate(() => {
     const plus = [...document.querySelectorAll<HTMLElement>("button,[role=button]")]
-      .filter((b) => b.offsetParent !== null)
-      .find((b) =>
-        /^\+$|add clip|add media/i.test(`${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""}`.trim()),
-      );
+      .filter((b) => b.getClientRects().length > 0 && !b.closest(".cdk-overlay-container"))
+      .find((b) => /^(\+|add clip)$/i.test((b.getAttribute("aria-label") ?? b.textContent ?? "").trim()));
     if (!plus) return false;
     plus.click();
     return true;
@@ -215,11 +221,27 @@ async function openTimelinePopover(): Promise<boolean> {
   if (!opened) return false;
 
   await page.waitForTimeout(800);
-  // "Add Clip" is the first popover item; "Extend" is the charged one below it.
-  await page.keyboard.press("ArrowDown");
-  await page.keyboard.press("Enter");
+  const picked = await page.evaluate(() => {
+    const items = [
+      ...document.querySelectorAll<HTMLElement>(
+        ".cdk-overlay-pane button, .cdk-overlay-pane [role=menuitem], .cdk-overlay-pane [role=option]",
+      ),
+    ].filter((e) => e.getClientRects().length > 0);
+    const label = (e: HTMLElement) =>
+      (e.getAttribute("aria-label") || e.innerText || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/^add\s+/i, ""); // icon ligature
+    const addClip = items.find((e) => !/extend/i.test(e.innerText) && /^add clip$/i.test(label(e)));
+    if (!addClip) {
+      document.querySelector<HTMLElement>(".cdk-overlay-backdrop")?.click();
+      return false;
+    }
+    addClip.click();
+    return true;
+  });
   await page.waitForTimeout(800);
-  return true;
+  return picked;
 }
 
 /**
