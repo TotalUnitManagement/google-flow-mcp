@@ -131,6 +131,19 @@ async function send(): Promise<void> {
 
   for (let i = 0; i < 10; i++) {
     await page.waitForTimeout(800);
+    // Flow reports a refused submission in a toast, and may clear the prompt box as
+    // it does so — which would otherwise read as "accepted" below.
+    const refused = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>("mat-snack-bar-container,[role=alert],[aria-live=assertive]")]
+        .map((e) => e.innerText.replace(/\s+/g, " ").trim())
+        .find((t) => /couldn.?t|could not|failed|error|unable|try again|policy|violat|not allowed/i.test(t)),
+    );
+    if (refused) {
+      throw new FlowError(
+        `Flow refused the generation: "${refused.slice(0, 200)}"`,
+        "Flow reported this before starting anything; check the balance with flow_check_session. Do not resubmit unchanged.",
+      );
+    }
     // A confirmation dialog we do not know about: stop without clicking anything.
     const dialog = await page.evaluate(() =>
       [...document.querySelectorAll<HTMLElement>("[role=dialog],[role=alertdialog]")]
@@ -332,11 +345,17 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
   }
 
   const expected = settings.outputsPerPrompt ?? 1;
-  const mediaIds = await awaitNewMedia(
-    before,
-    opts.timeoutMs ?? (opts.free ? TIMEOUTS.stillMs : TIMEOUTS.renderMs),
-    expected,
-  );
+  let mediaIds: string[];
+  try {
+    mediaIds = await awaitNewMedia(
+      before,
+      opts.timeoutMs ?? (opts.free ? TIMEOUTS.stillMs : TIMEOUTS.renderMs),
+      expected,
+    );
+  } catch (err) {
+    await settleTimeout(err as Error, { opts, charged, balanceBefore });
+    throw err;
+  }
   const files = await saveAll(mediaIds, opts.outFile, opts.free ? "jpg" : "mp4");
   const balanceAfter = await readCredits();
 
@@ -351,6 +370,47 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
   });
 
   return { verdict: "downloaded", quotedCost: charged, charged, mediaIds, files, balanceAfter, tier: "dom", notes };
+}
+
+/**
+ * A send that produced no media. The balance is the ground truth: if it has not
+ * moved and nothing is still rendering, Flow never started the job (seen live: a
+ * Frames send cleared the prompt box, charged nothing, produced nothing), so the
+ * run budget is refunded. Anything else is recorded as charged and possibly still
+ * rendering. Either way it reaches the ledger, which it previously never did.
+ */
+async function settleTimeout(
+  err: Error,
+  ctx: { opts: GenerateOptions; charged: number; balanceBefore: number | null },
+): Promise<void> {
+  const kind = ctx.opts.free ? "still" : "video";
+  try {
+    const page = await getFlowPage();
+    const rendering = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>("flow-grid-tile-container")].some((t) =>
+        /\b\d{1,3}%/.test(t.innerText),
+      ),
+    );
+    const balanceAfter = await readCredits();
+    const neverStarted =
+      ctx.charged > 0 && !rendering && ctx.balanceBefore !== null && balanceAfter === ctx.balanceBefore;
+    if (neverStarted) {
+      await recordSpend(-ctx.charged);
+      err.message += ` The balance is unchanged at ${balanceAfter} and nothing is rendering, so Flow never started it: nothing was charged, and the run budget was refunded.`;
+    }
+    await log({
+      kind,
+      opts: ctx.opts,
+      quoted: ctx.charged,
+      charged: neverStarted ? 0 : ctx.charged,
+      balance: balanceAfter,
+      verdict: neverStarted ? "rejected" : "in_flight",
+      files: [],
+      note: neverStarted ? "sent but never started (balance unchanged)" : "timed out waiting for media",
+    });
+  } catch {
+    /* the original timeout error is what the caller needs */
+  }
 }
 
 async function saveAll(mediaIds: string[], outFile: string | undefined, ext: string): Promise<string[]> {
