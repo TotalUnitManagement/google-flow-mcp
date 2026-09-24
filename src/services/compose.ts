@@ -313,24 +313,60 @@ async function openFrameSlot(slot: "Start" | "End"): Promise<void> {
   }
 }
 
-/** Media ids currently shown in the composer's frame slots, in order. */
-async function frameSlotIds(): Promise<string[]> {
+/** @internal exported for unit tests. The opaque image token in a `/asb/<token>=s…` url. */
+export function asbToken(src: string | null | undefined): string | null {
+  return /\/asb\/([^=?/]+)/.exec(src ?? "")?.[1] ?? null;
+}
+
+/**
+ * media id -> /asb/ token, read from the grid. On flow.google.com the frame picker
+ * and the composer slots render images from lh3.googleusercontent.com/asb/<token>
+ * with no media id anywhere; only the grid's `[data-media-id]` img ties an id to
+ * its token (served there from flow.google.com/asb/<token>).
+ */
+async function gridMediaTokens(): Promise<Record<string, string>> {
   const page = await getFlowPage();
-  return page.evaluate(() => {
+  const pairs = await page.evaluate(() =>
+    [...document.querySelectorAll<HTMLElement>("[data-media-id]")].map((el) => [
+      el.getAttribute("data-media-id") ?? "",
+      el.getAttribute("src") ?? el.querySelector("img")?.getAttribute("src") ?? "",
+    ]),
+  );
+  const map: Record<string, string> = {};
+  for (const [id, src] of pairs) {
+    const token = asbToken(src);
+    if (id && token) map[id] = token;
+  }
+  return map;
+}
+
+/** Media ids currently shown in the composer's frame slots, in order. */
+async function frameSlotIds(tokens: Record<string, string>): Promise<string[]> {
+  const page = await getFlowPage();
+  const srcs = await page.evaluate(() => {
     let scope: HTMLElement | null = document.querySelector<HTMLElement>(".ProseMirror");
     for (let k = 0; k < 8 && scope?.parentElement; k++) scope = scope.parentElement;
     scope = scope ?? document.body;
-    return [...scope.querySelectorAll<HTMLImageElement>("img")]
-      .map((i) => i.getAttribute("data-media-id") ?? /\/image\/([0-9a-f-]{36})/.exec(i.src)?.[1] ?? null)
-      .filter((x): x is string => Boolean(x));
+    return [...scope.querySelectorAll<HTMLImageElement>("img")].map((i) => ({
+      id: i.getAttribute("data-media-id"),
+      src: i.src,
+    }));
   });
+  const byToken = new Map(Object.entries(tokens).map(([id, token]) => [token, id]));
+  return srcs
+    .map(({ id, src }) => {
+      const token = asbToken(src);
+      return id ?? /\/image\/([0-9a-f-]{36})/.exec(src)?.[1] ?? (token ? byToken.get(token) : undefined) ?? null;
+    })
+    .filter((x): x is string => Boolean(x));
 }
 
 /**
  * Put library images into the Start/End frame slots and VERIFY by media id.
  *
- * The picker lists every image as a role=option button whose <img> src is the
- * signed /image/<id> url, so the id, not the name, is what gets matched.
+ * The picker lists every image as a role=option button. Its <img> carries no
+ * media id on flow.google.com, so options are matched by the /asb/ token the
+ * grid maps to that id (legacy /image/<id> urls still match directly).
  */
 export async function attachFrames(
   startId?: string,
@@ -340,6 +376,7 @@ export async function attachFrames(
   const page = await getFlowPage();
   const attached: string[] = [];
   const missing: string[] = [];
+  const tokens = await gridMediaTokens();
 
   for (const [slot, id] of [
     ["Start", startId],
@@ -347,18 +384,23 @@ export async function attachFrames(
   ] as const) {
     if (!id) continue;
     await openFrameSlot(slot);
-    const ok = await page.evaluate((mediaId) => {
-      const pane = [...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane,[role=dialog]")].find((p) =>
-        /Select a frame image/i.test(p.innerText),
-      );
-      const option = [...(pane?.querySelectorAll<HTMLElement>("[role=option]") ?? [])].find((o) => {
-        const img = o.querySelector("img");
-        return !!img && (img.src.includes(mediaId) || img.getAttribute("data-media-id") === mediaId);
-      });
-      if (!option) return false;
-      option.click();
-      return true;
-    }, id);
+    const ok = await page.evaluate(
+      ({ mediaId, token }) => {
+        const pane = [...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane,[role=dialog]")].find((p) =>
+          /Select a frame image/i.test(p.innerText),
+        );
+        const option = [...(pane?.querySelectorAll<HTMLElement>("[role=option]") ?? [])].find((o) => {
+          const img = o.querySelector("img");
+          if (!img) return false;
+          if (img.src.includes(mediaId) || img.getAttribute("data-media-id") === mediaId) return true;
+          return token !== null && /\/asb\/([^=?/]+)/.exec(img.src)?.[1] === token;
+        });
+        if (!option) return false;
+        option.click();
+        return true;
+      },
+      { mediaId: id, token: tokens[id] ?? null },
+    );
     if (!ok) {
       missing.push(id);
       await closePicker();
@@ -374,7 +416,7 @@ export async function attachFrames(
     attached.push(id);
   }
 
-  const inSlots = await frameSlotIds();
+  const inSlots = await frameSlotIds(tokens);
   const verified = attached.filter((id) => inSlots.includes(id));
   if (verified.length !== attached.length) {
     throw new FlowError(
@@ -446,7 +488,7 @@ export async function uploadMedia(filePath: string): Promise<{ file: string; med
  */
 export async function clearAttachments(): Promise<number> {
   const page = await getFlowPage();
-  const had = (await frameSlotIds()).length;
+  const had = (await frameSlotIds(await gridMediaTokens())).length;
   await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
   await page.waitForTimeout(3_000);
   return had;
