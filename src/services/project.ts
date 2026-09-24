@@ -24,17 +24,27 @@ export interface FlowProject {
 export async function listProjects(): Promise<FlowProject[]> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
+  // The Angular grid renders after domcontentloaded; on a freshly launched browser
+  // an immediate scan finds nothing. A home page with no projects just times out.
+  await page.waitForSelector('a[href*="/project/"]', { timeout: 8_000 }).catch(() => undefined);
 
   return page.evaluate(() => {
     const seen = new Map<string, { projectId: string; name: string | null; url: string }>();
     for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href*="/project/"]')) {
       const m = /\/project\/([A-Za-z0-9_-]+)/.exec(a.href);
       if (!m || seen.has(m[1])) continue;
-      seen.set(m[1], {
-        projectId: m[1],
-        name: (a.getAttribute("aria-label") ?? a.textContent ?? "").trim() || null,
-        url: a.href,
-      });
+      // The link is a thumbnail labelled "Open project"; the title is the text node
+      // of the card's .project-title-label, beside its "Edit project title" button.
+      const label = a.closest("flow-project-card")?.querySelector(".project-title-label");
+      const title = label
+        ? [...label.childNodes]
+            .filter((n) => n.nodeType === Node.TEXT_NODE)
+            .map((n) => n.textContent ?? "")
+            .join(" ")
+            .trim()
+        : "";
+      const fallback = (a.textContent ?? "").trim();
+      seen.set(m[1], { projectId: m[1], name: title || fallback || null, url: a.href });
     }
     return [...seen.values()];
   });

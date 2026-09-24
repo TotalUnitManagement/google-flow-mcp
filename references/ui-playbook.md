@@ -129,6 +129,10 @@ Flow moved from `labs.google/fx/tools/flow` (Next.js + tRPC) to `flow.google.com
 paths and `/fx/api/auth/session` are gone.
 
 - **Project URL:** `https://flow.google.com/project/<uuid>`.
+- **Projects grid:** `flow-project-card` per project. The link is a thumbnail
+  (`a.project-thumbnail-container`, `aria-label="Open project"` on every card); the
+  title is the text node of `.project-title-label`, which also holds the "Edit
+  project title" button. The grid renders after `domcontentloaded`, so wait for it.
 - **Signed in:** the One Google bar button `aria-label="Google Account: <name> (<email>)"`.
 - **Composer:** `.ProseMirror[contenteditable=true]`. Send is `button[aria-label="Start generation"]`.
 - **Agent vs direct:** `button.agent-mode-chip[aria-pressed]`. The server runs in
