@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { config } from "../config.js";
-import { FLOW_HOME, FLOW_ORIGIN, STOP_SIGNALS, TIMEOUTS } from "../constants.js";
+import { FLOW_HOME, FLOW_ORIGIN, STOP_SIGNALS, TIMEOUTS, isFlowUrl } from "../constants.js";
 import { FlowError, StopSignalError } from "../types.js";
 
 let browser: Browser | null = null;
@@ -26,7 +26,7 @@ export async function getContext(): Promise<BrowserContext> {
         `Could not attach to Chrome at ${config.cdpUrl}: ${(err as Error).message}`,
         `Start Chrome with remote debugging, then retry:\n` +
           `  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.google-flow-mcp/chrome-profile"\n` +
-          `Log into labs.google/fx/tools/flow in that window first. ` +
+          `Log into flow.google.com in that window first. ` +
           `Or unset FLOW_CDP_URL to let this server launch its own browser.`,
       );
     }
@@ -42,6 +42,15 @@ export async function getContext(): Promise<BrowserContext> {
     });
     browser = null;
     mode = "launched";
+    // A launched context has no Browser to ask isConnected(); without this, closing
+    // the window leaves a dead handle that every later call trips over.
+    const launched = context;
+    launched.on("close", () => {
+      if (context !== launched) return;
+      context = null;
+      page = null;
+      mode = "none";
+    });
   }
 
   context.setDefaultTimeout(TIMEOUTS.evalMs);
@@ -64,16 +73,16 @@ export function browserMode(): "cdp-attach" | "launched" | "none" {
 export async function getFlowPage(): Promise<Page> {
   const ctx = await getContext();
 
-  if (page && !page.isClosed() && page.url().startsWith(FLOW_ORIGIN)) return page;
+  if (page && !page.isClosed() && isFlowUrl(page.url())) return page;
 
-  const existing = ctx.pages().find((p) => !p.isClosed() && p.url().includes("/fx/tools/flow"));
+  const existing = ctx.pages().find((p) => !p.isClosed() && isFlowUrl(p.url()));
   if (existing) {
     page = existing;
     return page;
   }
 
   page = ctx.pages().find((p) => !p.isClosed()) ?? (await ctx.newPage());
-  if (!page.url().includes("/fx/tools/flow")) {
+  if (!isFlowUrl(page.url())) {
     await page.goto(FLOW_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
   return page;
@@ -107,7 +116,7 @@ export async function assertNoStopSignal(p?: Page): Promise<void> {
   }
 }
 
-/** Cookies for the labs.google origin, for the Node-side HTTP tier. */
+/** Cookies for the Flow origin, for the Node-side HTTP tier. */
 export async function cookieHeader(): Promise<string> {
   const ctx = await getContext();
   const cookies = await ctx.cookies(FLOW_ORIGIN);

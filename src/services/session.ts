@@ -1,4 +1,3 @@
-import { AUTH_SESSION_URL } from "../constants.js";
 import { config } from "../config.js";
 import type { SessionState } from "../types.js";
 import { assertNoStopSignal, browserMode, getFlowPage } from "./browser.js";
@@ -38,16 +37,16 @@ export async function readSession(): Promise<SessionState> {
     state.blockedBy = (err as Error).message;
   }
 
-  // NextAuth session endpoint: cheapest logged-in probe, and it never charges.
+  // flow.google.com has no NextAuth endpoint. The One Google bar's account button
+  // carries "Google Account: <name> (<email>)" only when a user is signed in.
   try {
-    const session = await page.evaluate(async (url) => {
-      const r = await fetch(url, { credentials: "include" });
-      return r.ok ? await r.text() : null;
-    }, AUTH_SESSION_URL);
-    if (session) {
-      const parsed = JSON.parse(session) as { user?: { email?: string; name?: string } };
-      state.account = parsed?.user?.email ?? parsed?.user?.name ?? null;
-      state.loggedIn = Boolean(state.account);
+    const label = await page.evaluate(() => {
+      const el = document.querySelector<HTMLElement>('[aria-label^="Google Account:"]');
+      return el?.getAttribute("aria-label") ?? null;
+    });
+    if (label) {
+      state.account = /\(([^)]+@[^)]+)\)/.exec(label)?.[1] ?? label.replace(/^Google Account:\s*/, "");
+      state.loggedIn = true;
     }
   } catch {
     // Fall through to the URL heuristic below.

@@ -10,7 +10,7 @@ import { config } from "./config.js";
 import { ABSOLUTE_COST_CEILING, CREDIT_COSTS, RETRY_BUDGET_MULTIPLIER } from "./constants.js";
 import { listApps, openApp } from "./services/apps.js";
 import { closeBrowser } from "./services/browser.js";
-import { readSettings, setSetting, uploadMedia, upscale } from "./services/compose.js";
+import { applySettings, readSettings, uploadMedia, upscale } from "./services/compose.js";
 import { discoverApi, formatReport, verifyHttpTier } from "./services/discovery.js";
 import { collect, generate } from "./services/generate.js";
 import { deleteMedia, downloadMedia, listMedia } from "./services/media.js";
@@ -146,7 +146,7 @@ server.registerTool(
   {
     title: "Generate still images (free)",
     description:
-      "Generate still images in Flow. Stills cost ZERO credits, so this is the sandbox where composition should be iterated until right — always compose in stills before spending anything on video. Downloads the results and returns local file paths.",
+      "Generate still images with the composer's image model. The composer's quote is read before sending and the call refuses unless it is exactly 0 credits, so this never spends. Compose in stills before spending anything on video. Downloads every output and returns local file paths and media ids.",
     inputSchema: {
       prompt: z.string().min(10).max(4000).describe("Full composition prompt: subject, setting, light, lens, grade"),
       out_file: z.string().optional().describe("Output filename; relative paths resolve under FLOW_OUTPUT_DIR"),
@@ -179,7 +179,7 @@ server.registerTool(
   {
     title: "Price a generation without paying",
     description:
-      "Submit a request to Flow, read the quoted credit cost from its proposal, then REJECT it. Costs exactly zero — a rejected proposal is never charged. Use this to confirm the project's model tier before committing to a batch.",
+      "Set up the video composer with this prompt, read the price it quotes, then clear it without sending. Costs exactly zero. Use it to confirm the model tier before committing to a batch.",
     inputSchema: {
       prompt: z.string().min(10).max(4000).describe("The prompt you intend to run"),
     },
@@ -189,8 +189,8 @@ server.registerTool(
     try {
       const result = await generate({ prompt, expectedMaxCost: ABSOLUTE_COST_CEILING, dryRun: true });
       return ok(
-        `Flow quoted ${result.quotedCost} credits. Proposal rejected — nothing charged.\n` +
-          `Reference: Veo 3.1 Lite 10, Fast 20, Quality 100. A quote far above the intended tier means the project settings are wrong.`,
+        `The composer quoted ${result.quotedCost} credits. Nothing was sent or charged.\n` +
+          `Reference: Veo 3.1 Lite 10, Fast 20, Quality 100 per 8s clip; Omni 1.1 Flash 6 (360p) / 12 (720p). A quote above the intended tier means the settings are wrong.`,
         { quotedCost: result.quotedCost, charged: 0 },
       );
     } catch (err) {
@@ -204,7 +204,7 @@ server.registerTool(
   {
     title: "Generate video (SPENDS CREDITS)",
     description:
-      "Generate a video clip in Flow. THIS SPENDS REAL CREDITS. The cost quoted by Flow is read and checked against expected_max_cost and the run budget BEFORE approval; if it exceeds either, the proposal is rejected and nothing is charged. The generation MODE is set by what you attach: start_frame_media_id gives Frames-to-Video (preserves the approved composition — the normal path), reference_media_ids gives Ingredients-to-Video (recomposes from up to 3 references), and attaching nothing gives Text-to-Video (least control). Compose in free stills first and animate an approved still rather than generating blind. Never call this twice for the same clip while one is in flight — a resubmit is a second charge. Model tier and aspect ratio are per-project settings; set them with flow_settings, not here.",
+      "Generate a video clip in Flow. THIS SPENDS REAL CREDITS. The composer's quoted cost is read and checked against expected_max_cost and the run budget BEFORE sending; if it exceeds either, the prompt is cleared and nothing is charged. The generation MODE is set by what you attach: start_frame_media_id gives Frames-to-Video (preserves the approved composition — the normal path), reference_media_ids gives Ingredients-to-Video (recomposes from up to 3 references), and attaching nothing gives Text-to-Video (least control). Compose in free stills first and animate an approved still rather than generating blind. Never call this twice for the same clip while one is in flight — a resubmit is a second charge. Model tier and aspect ratio are per-project settings; set them with flow_settings, not here.",
     inputSchema: {
       prompt: z
         .string()
@@ -261,7 +261,7 @@ server.registerTool(
       });
       const summary =
         result.verdict === "in_flight"
-          ? `Approved at ${result.charged} credits and returned without waiting. Use flow_collect to download.`
+          ? `Sent at ${result.charged} credits and returned without waiting. Use flow_collect to download.`
           : `Charged ${result.charged} credits. Saved:\n${result.files.join("\n")}\nBalance after: ${result.balanceAfter ?? "unknown"}`;
       return ok(`${summary}\n\n${result.notes.join("\n")}`, {
         verdict: result.verdict,
@@ -489,46 +489,77 @@ server.registerTool(
 server.registerTool(
   "flow_settings",
   {
-    title: "Read or change project generation settings",
+    title: "Read or change composer generation settings",
     description:
-      "Read or change Flow's per-PROJECT generation settings: model tier, aspect ratio, and outputs per prompt. These are project globals, not per-generation arguments — set once, they persist across chat turns. Changing the tier is free and is the highest-leverage cost control there is: moving a project from Veo Quality to Fast turns every subsequent clip from 100 credits into 20. Re-read this after switching projects.",
+      "Read or change the settings of Flow's prompt box on flow.google.com: kind (image/video), video mode (frames/ingredients), model, aspect ratio, resolution, clip length and outputs per prompt, plus the price the composer quotes for the next submission. Free: nothing is sent. The model tier is the biggest cost lever (Veo 3.1 Fast 20 credits per 8s clip, Lite 10, Quality 100; Omni 1.1 Flash 6 at 360p or 12 at 720p per 8s). Settings persist in the composer between calls.",
     inputSchema: {
       action: z.enum(["get", "set"]).default("get"),
-      model: z.string().optional().describe('Exact option label, e.g. "Veo 3.1 Fast". Only for action=set'),
-      aspect_ratio: z.enum(["16:9", "9:16", "1:1"]).optional().describe("Only for action=set"),
+      kind: z.enum(["image", "video"]).optional().describe("Only for action=set"),
+      video_mode: z.enum(["frames", "ingredients"]).optional().describe("Only for action=set"),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          'Exact option label, e.g. "Veo 3.1 - Fast", "Omni 1.1 Flash", "Nano Banana 2 Lite". Only for action=set',
+        ),
+      aspect_ratio: z.enum(["16:9", "9:16", "4:3", "1:1", "3:4"]).optional().describe("Only for action=set"),
+      resolution: z.enum(["360p", "720p", "1080p"]).optional().describe("Only offered for some models"),
       outputs_per_prompt: z
         .number()
         .int()
         .min(1)
         .max(4)
         .optional()
-        .describe("Keep at 1 — outputs multiply cost linearly"),
+        .describe("Keep at 1 for video: outputs multiply cost linearly"),
       duration_seconds: z
         .number()
         .int()
         .min(4)
         .max(10)
         .optional()
-        .describe("Clip length. A cost lever on Gemini Omni Flash, which charges 15/20/25/30 credits by duration"),
+        .describe("Clip length, where the model offers a choice (Omni: 4/6/8/10s). Veo is fixed at 8s"),
       response_format: responseFormat,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async ({ action, model, aspect_ratio, outputs_per_prompt, duration_seconds, response_format }) => {
+  async ({
+    action,
+    kind,
+    video_mode,
+    model,
+    aspect_ratio,
+    resolution,
+    outputs_per_prompt,
+    duration_seconds,
+    response_format,
+  }) => {
     try {
-      let settings = await readSettings();
-      if (action === "set") {
-        if (model) settings = await setSetting("model", model);
-        if (aspect_ratio) settings = await setSetting("aspectRatio", aspect_ratio);
-        if (outputs_per_prompt) settings = await setSetting("outputsPerPrompt", String(outputs_per_prompt));
-        if (duration_seconds) settings = await setSetting("durationSeconds", `${duration_seconds}s`);
-      }
+      const settings =
+        action === "set"
+          ? await applySettings({
+              kind,
+              videoMode: video_mode,
+              model,
+              aspectRatio: aspect_ratio,
+              resolution,
+              outputsPerPrompt: outputs_per_prompt,
+              durationSeconds: duration_seconds,
+            })
+          : await readSettings();
       if (response_format === "json") return ok(JSON.stringify(settings, null, 2), { ...settings });
+      const agent =
+        settings.agentMode === null ? "unknown" : settings.agentMode ? "ON (switched off before generating)" : "off";
       return ok(
-        `Model: ${settings.model ?? "unknown"}\nAspect: ${settings.aspectRatio ?? "unknown"}\n` +
-          `Outputs per prompt: ${settings.outputsPerPrompt ?? "unknown"}\nDuration: ${settings.durationSeconds ?? "unknown"}s\n` +
-          `Confirm gate: ${settings.confirmGate}\n\n` +
-          `Costs: Lite 10 cr, Fast 20 cr, Quality 100 cr. Outputs multiply cost linearly — keep this at 1 unless told otherwise.`,
+        [
+          `Kind: ${settings.kind ?? "unknown"}${settings.videoMode ? ` (${settings.videoMode})` : ""}`,
+          `Model: ${settings.model ?? "unknown"}`,
+          `Aspect: ${settings.aspectRatio ?? "unknown"}`,
+          `Resolution: ${settings.resolution ?? "n/a"}`,
+          `Duration: ${settings.durationSeconds ? settings.durationSeconds + "s" : "n/a"}`,
+          `Outputs per prompt: ${settings.outputsPerPrompt ?? "unknown"}`,
+          `Agent mode: ${agent}`,
+          `Quoted price of the next submission: ${settings.quotedCredits ?? "unknown"} credits`,
+        ].join("\n"),
         { ...settings },
       );
     } catch (err) {
@@ -542,7 +573,7 @@ server.registerTool(
   {
     title: "Upload a local image into Flow",
     description:
-      "Upload a local image file into the Flow project so it can be used as a start frame or reference. Free. After upload, confirm the resulting media id with flow_list_media before animating it.",
+      "Upload a local image file into the Flow project so it can be used as a start or end frame. Free. Returns the new media id once the library shows it.",
     inputSchema: { file_path: z.string().describe("Absolute path to a local image file") },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },

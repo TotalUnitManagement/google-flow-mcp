@@ -1,4 +1,4 @@
-import { FLOW_HOME } from "../constants.js";
+import { FLOW_HOME, projectUrl } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
 import { extractProjectId } from "./session.js";
@@ -42,7 +42,7 @@ export async function listProjects(): Promise<FlowProject[]> {
 
 export async function openProject(projectId: string): Promise<FlowProject> {
   const page = await getFlowPage();
-  const url = `${FLOW_HOME}/project/${projectId}`;
+  const url = projectUrl(projectId);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   await page.waitForTimeout(3_000);
   await assertNoStopSignal(page);
@@ -73,7 +73,9 @@ export async function createProject(name?: string): Promise<FlowProject> {
   const clicked = await page.evaluate(() => {
     const btn = [...document.querySelectorAll<HTMLElement>("button,[role=button],a")].find((b) => {
       const label = `${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""}`.replace(/\s+/g, " ").trim();
-      return /^(new project|create project|new)$/i.test(label) && b.offsetParent !== null;
+      return (
+        /^(add_2\s*)?(new project|create project|new|start a new project)$/i.test(label) && b.offsetParent !== null
+      );
     });
     if (!btn) return false;
     btn.click();
