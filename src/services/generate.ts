@@ -243,6 +243,19 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
       "no quote",
     );
   }
+  // ensureDirectMode() clicks the toggle but cannot see whether it took. In Agent
+  // mode Flow's agent may charge on its own if "Confirm before generating" is Never,
+  // bypassing the quote above — so anything but a confirmed direct mode refuses.
+  if (settings.agentMode !== false) {
+    await refuse(
+      new FlowError(
+        settings.agentMode ? "The composer is still in Agent mode." : "Could not read the composer's Agent toggle.",
+        "Nothing was sent or charged. Turn Agent mode off in the composer and retry.",
+      ),
+      "rejected",
+      "not in direct mode",
+    );
+  }
   if (opts.free && quote !== 0) {
     await refuse(
       new BudgetError(

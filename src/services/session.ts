@@ -119,8 +119,9 @@ export function describeSession(s: SessionState): string {
   if (s.blockedBy) lines.push(`BLOCKED: ${s.blockedBy}`);
   if (s.confirmGate !== "always") {
     lines.push(
-      `WARNING: the approval gate is not confirmed ON. Flow may generate and charge without showing a cost card. ` +
-        `Open Settings -> "Confirm before generating" and set it to Always before any paid generation.`,
+      `Note: "Confirm before generating" is not confirmed Always. On flow.google.com it only governs Agent mode; ` +
+        `this server sends in direct mode behind the composer's price quote and refuses if Agent mode is on. ` +
+        `If you use Agent mode by hand, set it to Always in the session panel's agent settings.`,
     );
   }
   return lines.join("\n");
