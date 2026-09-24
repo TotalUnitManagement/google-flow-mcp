@@ -91,22 +91,34 @@ export function parseCredits(text: string): number | null {
 export async function readCredits(): Promise<number | null> {
   try {
     const page = await getFlowPage();
-    const panel = "flow-account-panel";
-    const alreadyOpen = (await page.locator(panel).count()) > 0;
-    if (!alreadyOpen) await page.locator('[aria-label^="Google Account:"]').first().click({ timeout: 5_000 });
-    try {
-      const count = page.locator(`${panel} .credits-count`).first();
-      await count.waitFor({ state: "visible", timeout: 5_000 });
-      const n = parseCredits((await count.textContent()) ?? "");
-      if (n !== null) return n;
-    } finally {
+    // One in-page script, as verified live: a DOM click, not locator.click(). The
+    // account button failed Playwright's actionability wait in the launched
+    // profile and the balance silently read null, though the same button's label
+    // is what proves sign-in.
+    const text = await page.evaluate(async () => {
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      const panel = () => document.querySelector<HTMLElement>("flow-account-panel");
+      const alreadyOpen = panel() !== null;
       if (!alreadyOpen) {
-        await page
-          .locator(`${panel} button[aria-label="Close account panel"]`)
-          .click({ timeout: 3_000 })
-          .catch(() => undefined);
+        const trigger = [...document.querySelectorAll<HTMLElement>('[aria-label^="Google Account:"]')].find(
+          (e) => e.getClientRects().length > 0,
+        );
+        if (!trigger) return null;
+        trigger.click();
       }
-    }
+      let count: Element | null = null;
+      for (let i = 0; i < 40 && !count?.textContent?.trim(); i++) {
+        await sleep(150);
+        count = panel()?.querySelector(".credits-count") ?? null;
+      }
+      const read = count?.textContent?.trim() ?? null;
+      if (!alreadyOpen) {
+        panel()?.querySelector<HTMLElement>('button[aria-label="Close account panel"]')?.click();
+      }
+      return read;
+    });
+    const n = parseCredits(text ?? "");
+    if (n !== null) return n;
   } catch {
     /* fall through to the page-text scan */
   }
