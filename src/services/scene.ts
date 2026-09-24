@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { KNOWN_PROCEDURES, MIN_MEDIA_BYTES, TIMEOUTS } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
+import { openVideoEditor, videoToken } from "./media.js";
 import { clickByText } from "./transport.js";
 
 /**
@@ -20,22 +21,41 @@ import { clickByText } from "./transport.js";
  * the wire, which is both simpler and immune to the app changing its fetch usage.
  */
 
+/**
+ * Export the open scene editor (flow.google.com: /project/<p>/edit/<id>).
+ *
+ * The editor's top-bar "Download media" menu offers "270p Animated GIF",
+ * "360p Original size" and "720p Upscaled"; this picks "Original size". What
+ * arrives is taken from whichever channel carries it, armed before the click:
+ *   1. a browser download (Playwright's `download` event) — saved as-is;
+ *   2. a flow-content.google/video request — observed for a one-clip scene,
+ *      where the export IS the clip; fetched from Node (self-signed url);
+ *   3. the legacy base64 concat payload, kept for older deployments.
+ * A multi-clip export is not yet observed, which is why all three are armed.
+ * Every result must be a real MP4 before anything is written.
+ */
 export async function exportScene(
   outFile: string,
   timeoutMs = TIMEOUTS.exportMs,
-): Promise<{ file: string; bytes: number }> {
+): Promise<{ file: string; bytes: number; via: "download" | "cdn" | "legacy" }> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
 
-  if (!/\/scene\//.test(page.url())) {
+  if (!/\/(edit|scene)\//.test(page.url())) {
     throw new FlowError(
-      "The active tab is not a Scenebuilder scene.",
-      "Open the scene in the browser (top bar + -> Create Scene, or an existing /scene/<id>) and retry.",
+      "The browser is not in a scene editor.",
+      "Open one with flow_create_scene (it opens a clip's editor), then retry. Nothing was charged.",
     );
   }
 
-  // Arm the listener BEFORE clicking, or a fast job finishes unobserved.
-  const responsePromise = page
+  // Arm every channel BEFORE clicking, or a fast export finishes unobserved.
+  const download = page.waitForEvent("download", { timeout: timeoutMs }).catch(() => null);
+  let cdnUrl: string | null = null;
+  const onRequest = (req: import("playwright-core").Request) => {
+    if (!cdnUrl && /flow-content\.google\/video\/[0-9a-f-]{36}/.test(req.url())) cdnUrl = req.url();
+  };
+  page.on("request", onRequest);
+  const legacy = page
     .waitForResponse(
       (res) =>
         new RegExp(`${KNOWN_PROCEDURES.concatenateStatus}|${KNOWN_PROCEDURES.concatenate}`, "i").test(res.url()) &&
@@ -44,30 +64,97 @@ export async function exportScene(
     )
     .catch(() => null);
 
-  const clicked =
-    (await clickByText("Download", { exact: true, maxDescendants: 4 })) ||
-    (await clickByText("downloadDownload", { exact: true, maxDescendants: 4 }));
-  if (!clicked) {
+  try {
+    await chooseOriginalSize();
+
+    const target = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+
+    let first = await Promise.race([
+      download.then((d) => (d ? ({ kind: "download", d } as const) : null)),
+      waitFor(() => cdnUrl, timeoutMs).then((u) => (u ? ({ kind: "cdn", u } as const) : null)),
+    ]);
+    // The editor's player also loads clips from flow-content.google, so a CDN hit
+    // may be ONE clip of a multi-clip scene rather than the export. Give a real
+    // browser download a grace period to arrive and prefer it when it does.
+    if (first?.kind === "cdn") {
+      const late = await Promise.race([download, new Promise<null>((r) => setTimeout(() => r(null), 15_000))]);
+      if (late) first = { kind: "download", d: late };
+    }
+
+    let buffer: Buffer | null = null;
+    let via: "download" | "cdn" | "legacy" = "legacy";
+    if (first?.kind === "download") {
+      const tmp = await first.d.path().catch(() => null);
+      if (tmp) buffer = await fs.readFile(tmp);
+      via = "download";
+    } else if (first?.kind === "cdn") {
+      buffer = Buffer.from(await (await fetch(first.u, { redirect: "follow" })).arrayBuffer());
+      via = "cdn";
+    } else {
+      buffer = Buffer.from(await pollForEncodedVideo(legacy, timeoutMs), "base64");
+    }
+
+    if (!buffer || buffer.length < MIN_MEDIA_BYTES || buffer.subarray(4, 8).toString() !== "ftyp") {
+      throw new FlowError(
+        `Scene export returned ${buffer?.length ?? 0} bytes that are not a valid MP4.`,
+        "Nothing was written. The export may still be running — wait and retry, or download the scene in the browser.",
+      );
+    }
+    await fs.writeFile(target, buffer);
+    return { file: target, bytes: buffer.length, via };
+  } finally {
+    page.off("request", onRequest);
+  }
+}
+
+/** Open the editor's top-bar "Download media" menu and pick "Original size". Free. */
+async function chooseOriginalSize(): Promise<void> {
+  const page = await getFlowPage();
+  const opened = await page.evaluate(() => {
+    const trigger = [...document.querySelectorAll<HTMLElement>('button[aria-label="Download media"]')].find(
+      (b) => b.getClientRects().length > 0 && !b.closest(".cdk-overlay-container"),
+    );
+    if (!trigger) return false;
+    trigger.click();
+    return true;
+  });
+  if (!opened) {
     throw new FlowError(
-      "Could not find the scene's Download control.",
-      "Flow's Scenebuilder UI may have changed — check references/ui-playbook.md and re-run flow_discover_api.",
+      'Could not find the editor\'s "Download media" menu.',
+      "Flow's editor may have changed — see references/ui-playbook.md. Nothing was charged.",
     );
   }
-
-  const encoded = await pollForEncodedVideo(responsePromise, timeoutMs);
-  const buffer = Buffer.from(encoded, "base64");
-
-  if (buffer.length < MIN_MEDIA_BYTES || buffer.subarray(4, 8).toString() !== "ftyp") {
+  await page.waitForTimeout(800);
+  const picked = await page.evaluate(() => {
+    const item = [
+      ...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane [role=menuitem], .cdk-overlay-pane button"),
+    ]
+      .filter((e) => e.getClientRects().length > 0)
+      .find((e) => /Original size/i.test(e.innerText) && e.getAttribute("aria-disabled") !== "true");
+    if (!item) {
+      document.querySelector<HTMLElement>(".cdk-overlay-backdrop")?.click();
+      return false;
+    }
+    item.click();
+    return true;
+  });
+  if (!picked) {
     throw new FlowError(
-      `Scene export returned ${buffer.length} bytes that are not a valid MP4.`,
-      "Nothing was written. The export job may still be running — wait and retry, or download the scene manually in the browser.",
+      'The Download menu had no enabled "Original size" option.',
+      "Nothing was downloaded or charged. Check the menu in the browser.",
     );
   }
+}
 
-  const target = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, buffer);
-  return { file: target, bytes: buffer.length };
+async function waitFor<T>(probe: () => T | null, timeoutMs: number): Promise<T | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const v = probe();
+    if (v) return v;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
 }
 
 /**
@@ -114,61 +201,50 @@ async function extractEncoded(response: import("playwright-core").Response): Pro
 /**
  * SCENE ASSEMBLY (free)
  *
- * Flow's chat agent CANNOT create scenes — this is a UI-only surface. The path is
- * top bar "+" -> Create Scene -> an editor at /scene/<id>. Stitching there is
- * free; only "Extend" charges, and it lives behind its own gated tool below.
+ * flow.google.com has no "create empty scene": the old top-bar "+" -> Create
+ * Scene is gone (that menu now holds Upload / New collection / Create
+ * character). A scene is a clip's editor — opening any video routes to
+ * /project/<p>/edit/<id>, with a timeline, "Add clip" and Download. So a scene
+ * is "created" by opening the clip it starts with. Only "Extend" charges, and
+ * nothing here touches it.
  */
-export async function createScene(): Promise<{ sceneId: string; url: string }> {
+export async function createScene(firstClipMediaId: string): Promise<{ sceneId: string; url: string }> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
-
-  const clicked =
-    (await clickByText("Create Scene", { exact: false, maxDescendants: 4 })) ||
-    (await clickByText("New Scene", { exact: false, maxDescendants: 4 }));
-
-  if (!clicked) {
-    throw new FlowError(
-      "Could not find a Create Scene control.",
-      'It lives behind the top-bar "+" menu. Open that menu in the browser first, or create the scene manually and work in it directly.',
-    );
-  }
-
-  await page.waitForTimeout(4_000);
-  const sceneId = /\/scene\/([A-Za-z0-9_-]+)/.exec(page.url())?.[1];
-  if (!sceneId) {
-    throw new FlowError(
-      "Clicked Create Scene but the URL never became a /scene/<id>.",
-      "Check the browser — Flow may be showing a chooser that needs a manual selection.",
-    );
-  }
-  return { sceneId, url: page.url() };
+  const { editId, url } = await openVideoEditor(firstClipMediaId);
+  return { sceneId: editId, url };
 }
 
 /**
- * Add library clips to the open scene, in order. Free.
+ * Add library clips to the open scene editor, in order. Free.
  *
- * Two quirks are load-bearing here. The FIRST clip goes in via an "Add Clip"
- * button; later clips go through the timeline "+" popover, whose items resist
- * ordinary clicks — keyboard navigation is what actually works. And Escape exits
- * the whole editor rather than closing the popover, so it is never used to dismiss.
+ * On flow.google.com the editor already holds its first clip, so every clip goes
+ * through the timeline "+" popover — by exact "Add clip" label, never arrow keys,
+ * because the popover's other item is the charged "Extend". Escape exits the
+ * whole editor rather than closing the popover, so it is never used to dismiss.
+ * UNVERIFIED on flow.google.com: the clip picker that "Add clip" opens has not
+ * been observed; options are matched by media id or by the clip's /asb/ token.
  */
 export async function addClipsToScene(mediaIds: string[]): Promise<{ added: string[]; failed: string[] }> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
 
-  if (!/\/scene\//.test(page.url())) {
+  if (!/\/(edit|scene)\//.test(page.url())) {
     throw new FlowError(
-      "The active tab is not a Scenebuilder scene.",
-      "Create one with flow_create_scene, or open an existing /scene/<id> in the browser.",
+      "The browser is not in a scene editor.",
+      "Open one with flow_create_scene (it opens the first clip's editor), then add the rest. Nothing was charged.",
     );
   }
 
   const added: string[] = [];
   const failed: string[] = [];
 
-  for (const [index, mediaId] of mediaIds.entries()) {
-    const opened =
-      index === 0 ? await clickByText("Add Clip", { exact: false, maxDescendants: 4 }) : await openTimelinePopover();
+  for (const mediaId of mediaIds) {
+    const opened = /\/edit\//.test(page.url())
+      ? await openTimelinePopover()
+      : added.length === 0
+        ? await clickByText("Add Clip", { exact: false, maxDescendants: 4 })
+        : await openTimelinePopover();
 
     if (!opened) {
       failed.push(mediaId);
@@ -176,15 +252,20 @@ export async function addClipsToScene(mediaIds: string[]): Promise<{ added: stri
     }
     await page.waitForTimeout(1_500);
 
-    const picked = await page.evaluate((id) => {
-      const option = [...document.querySelectorAll<HTMLElement>("[role=option],[role=listitem],li")].find((o) => {
-        const img = o.querySelector("img");
-        return img ? img.src.includes(id) || img.src.includes(encodeURIComponent(id)) : false;
-      });
-      if (!option) return false;
-      option.click();
-      return true;
-    }, mediaId);
+    const picked = await page.evaluate(
+      ({ id, token }) => {
+        const option = [...document.querySelectorAll<HTMLElement>("[role=option],[role=listitem],li")].find((o) => {
+          const img = o.querySelector("img");
+          if (!img) return false;
+          if (img.src.includes(id) || img.src.includes(encodeURIComponent(id))) return true;
+          return token !== null && /\/asb\/([^=?/]+)/.exec(img.src)?.[1] === token;
+        });
+        if (!option) return false;
+        option.click();
+        return true;
+      },
+      { id: mediaId, token: videoToken(mediaId) },
+    );
 
     if (!picked) {
       failed.push(mediaId);

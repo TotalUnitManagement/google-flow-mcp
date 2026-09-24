@@ -390,9 +390,9 @@ server.registerTool(
 server.registerTool(
   "flow_export_scene",
   {
-    title: "Export the open Scenebuilder scene",
+    title: "Export the open scene editor",
     description:
-      "Export the currently open Scenebuilder scene to an MP4 on disk. Stitching clips is FREE — only Scenebuilder's 'Extend' costs credits, and this tool never uses it. Captures the export job's video payload directly, since Flow's export never writes a file itself.",
+      "Export the open scene editor (flow_create_scene) to an MP4 on disk at original size. FREE — only the editor's 'Extend' costs credits, and this tool never uses it. The result reports how it arrived: 'download' (a browser download), 'cdn' (the clip file; verified for one-clip scenes), or 'legacy'. Multi-clip export on flow.google.com is not yet verified — check a 'cdn' result from a multi-clip scene before relying on it.",
     inputSchema: {
       out_file: z.string().describe("Output .mp4 path; relative paths resolve under FLOW_OUTPUT_DIR"),
       timeout_seconds: z.number().int().min(30).max(900).default(300),
@@ -696,17 +696,19 @@ server.registerTool(
 server.registerTool(
   "flow_create_scene",
   {
-    title: "Create a Scenebuilder scene",
+    title: "Open a scene editor for a clip",
     description:
-      "Create a new Scenebuilder scene for stitching clips. FREE. Flow's chat agent cannot do this — it is a UI-only surface.",
-    inputSchema: {},
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      "Open the scene editor that starts with this video clip. FREE. On flow.google.com there is no empty scene: opening a clip routes to its editor (/project/<p>/edit/<id>), which holds the timeline. Then add clips with flow_add_clips_to_scene and export with flow_export_scene.",
+    inputSchema: {
+      first_clip_media_id: z.string().describe("Video media id from flow_list_media; the scene starts with this clip"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async () => {
+  async ({ first_clip_media_id }) => {
     try {
-      const scene = await createScene();
+      const scene = await createScene(first_clip_media_id);
       return ok(
-        `Created scene ${scene.sceneId}. Add clips with flow_add_clips_to_scene, then export with flow_export_scene. Stitching is free.`,
+        `Opened scene editor ${scene.sceneId}. Add clips with flow_add_clips_to_scene, then export with flow_export_scene. Stitching is free.`,
         { ...scene },
       );
     } catch (err) {

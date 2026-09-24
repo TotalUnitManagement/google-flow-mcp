@@ -112,7 +112,7 @@ export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaI
  * flow-content.google/video request it triggers, then return to the grid. Free:
  * viewing a clip generates nothing. Never touches the editor's controls.
  */
-async function openVideoTile(token: string): Promise<{ mediaId: string; url: string }> {
+async function openVideoTile(token: string, stay = false): Promise<{ mediaId: string; url: string; editUrl: string }> {
   const page = await getFlowPage();
   const gridUrl = page.url();
 
@@ -152,7 +152,8 @@ async function openVideoTile(token: string): Promise<{ mediaId: string; url: str
       .catch(() => null);
   }
 
-  if (page.url() !== gridUrl) {
+  const editUrl = page.url();
+  if (!stay && page.url() !== gridUrl) {
     await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
     if (page.url() !== gridUrl) await page.goto(gridUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
@@ -165,9 +166,43 @@ async function openVideoTile(token: string): Promise<{ mediaId: string; url: str
       "Nothing was charged. Flow's player may have changed; see references/ui-playbook.md.",
     );
   }
-  const resolved = { mediaId, url };
-  videoTiles.set(token, resolved);
-  return resolved;
+  videoTiles.set(token, { mediaId, url });
+  return { mediaId, url, editUrl };
+}
+
+/** The /asb/ thumbnail token of a video this run has resolved, for pickers that show no ids. */
+export function videoToken(mediaId: string): string | null {
+  return [...videoTiles.entries()].find(([, v]) => v.mediaId === mediaId)?.[0] ?? null;
+}
+
+/**
+ * Open a clip's editor and stay there. On flow.google.com a scene is not created
+ * empty: opening a video routes to /project/<p>/edit/<id>, which IS the scene
+ * editor for that clip (timeline, "Add clip", Download). Free.
+ */
+export async function openVideoEditor(mediaId: string): Promise<{ editId: string; url: string }> {
+  const start = await getFlowPage();
+  if (/\/edit\//.test(start.url())) {
+    // Tiles only exist on the grid; leave any open editor first.
+    await start.goto(start.url().replace(/\/edit\/.*$/, ""), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await start.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
+  }
+  const tokenFor = () => [...videoTiles.entries()].find(([, v]) => v.mediaId === mediaId)?.[0];
+  if (!tokenFor()) await listMedia(500, 0);
+  const token = tokenFor();
+  if (!token) {
+    throw new FlowError(
+      `No video tile in this project resolves to ${mediaId}.`,
+      "Scenes start from a video clip, not an image. Confirm the id with flow_list_media in the project that holds it.",
+    );
+  }
+  const page = await getFlowPage();
+  const { editUrl } = await openVideoTile(token, true);
+  const editId = /\/edit\/([0-9a-f-]{36})/.exec(editUrl)?.[1];
+  if (!editId || !/\/edit\//.test(page.url())) {
+    throw new FlowError("Opened the clip but the editor did not load.", "Check the browser. Nothing was charged.");
+  }
+  return { editId, url: page.url() };
 }
 
 /**
