@@ -317,18 +317,25 @@ server.registerTool(
   },
   async ({ limit, offset, response_format }) => {
     try {
-      const { items, total } = await listMedia(limit, offset);
+      const { items, total, unresolved } = await listMedia(limit, offset);
+      // Paging is over grid tiles, not resolved items: a tile that could not be
+      // resolved is reported in `unresolved`, not re-offered on the next page.
       const payload = {
         total,
         count: items.length,
         offset,
         items,
-        has_more: offset + items.length < total,
-        next_offset: offset + items.length,
+        unresolved,
+        has_more: offset + limit < total,
+        next_offset: Math.min(offset + limit, total),
       };
       if (response_format === "json") return ok(JSON.stringify(payload, null, 2), payload);
       const lines = items.map((i) => `${i.kind.padEnd(6)} ${i.mediaId}${i.name ? `  (${i.name})` : ""}`);
-      return ok(`${total} item(s), showing ${items.length} from offset ${offset}:\n\n${lines.join("\n")}`, payload);
+      const skipped = unresolved.length ? `\n\nCould not resolve ${unresolved.length}:\n${unresolved.join("\n")}` : "";
+      return ok(
+        `${total} item(s), showing ${items.length} from offset ${offset}:\n\n${lines.join("\n")}${skipped}`,
+        payload,
+      );
     } catch (err) {
       return fail(err);
     }

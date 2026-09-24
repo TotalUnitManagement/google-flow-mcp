@@ -45,7 +45,10 @@ interface GridEntry {
  * `NN%` label, or no loaded source yet) is left out, so "new media appeared"
  * means "finished".
  */
-export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaItem[]; total: number }> {
+export async function listMedia(
+  limit = 50,
+  offset = 0,
+): Promise<{ items: MediaItem[]; total: number; unresolved: string[] }> {
   const page = await getFlowPage();
   const entries: GridEntry[] = await page.evaluate(() => {
     const out: {
@@ -109,15 +112,23 @@ export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaI
   });
 
   const items: MediaItem[] = [];
+  const unresolved: string[] = [];
   for (const e of entries.slice(offset, offset + limit)) {
     let mediaId = e.mediaId;
     if (!mediaId && e.key) {
-      mediaId = (videoTiles.get(e.key) ?? (await openVideoTile(e.key).catch(() => null)))?.mediaId ?? null;
+      const key = e.key;
+      const hit =
+        videoTiles.get(key) ??
+        (await openVideoTile(key).catch((err: Error) => {
+          unresolved.push(`${key}: ${err.message}`);
+          return null;
+        }));
+      mediaId = hit?.mediaId ?? null;
     }
     if (!mediaId) continue; // could not resolve this tile; leave it out rather than guess
     items.push({ mediaId, kind: e.kind, name: e.name, thumbnailUrl: e.thumbnailUrl });
   }
-  return { items, total: entries.length };
+  return { items, total: entries.length, unresolved };
 }
 
 /**
