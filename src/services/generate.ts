@@ -208,13 +208,36 @@ async function send(): Promise<void> {
  * after the first arrives so every output of an x2/x3/x4 batch is collected.
  */
 async function awaitNewMedia(before: Set<string>, timeoutMs: number, expected = 1): Promise<string[]> {
-  const deadline = Date.now() + timeoutMs;
+  let deadline = Date.now() + timeoutMs;
+  // Observed 2026-09-24: a charged clip finished after the 480s window while the
+  // server's grid showed nothing, so the run "timed out" on a success. While a
+  // tile is visibly rendering (NN%), extend the wait, up to this much extra.
+  const extendUntil = deadline + 10 * 60_000;
   const page = await getFlowPage();
   let fresh: string[] = [];
   let settleUntil = 0;
+  let lastReload = Date.now();
 
-  while (Date.now() < deadline) {
+  for (;;) {
+    if (Date.now() >= deadline) {
+      const rendering = await page
+        .evaluate(() =>
+          [...document.querySelectorAll<HTMLElement>("flow-grid-tile-container")].some((t) =>
+            /\b\d{1,3}%/.test(t.innerText),
+          ),
+        )
+        .catch(() => false);
+      if (!rendering || fresh.length > 0 || Date.now() >= extendUntil) break;
+      deadline = Math.min(Date.now() + 60_000, extendUntil);
+    }
     await page.waitForTimeout(POLL_INTERVAL_MS);
+    // The grid may not live-update in the server's browser. After send the
+    // composer no longer matters, so a periodic reload is free and safe.
+    if (fresh.length === 0 && Date.now() - lastReload > 90_000) {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => null);
+      await page.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
+      lastReload = Date.now();
+    }
     await assertNoStopSignal(page);
     const { items } = await listMedia(500, 0);
     const now = items.map((i) => i.mediaId).filter((id) => !before.has(id));
@@ -228,7 +251,7 @@ async function awaitNewMedia(before: Set<string>, timeoutMs: number, expected = 
 
   if (fresh.length > 0) return fresh;
   throw new FlowError(
-    `The generation was sent but produced no new media within ${Math.round(timeoutMs / 1000)}s.`,
+    `The generation was sent but produced no new media within ${Math.round(timeoutMs / 1000)}s (plus any extension while a tile was rendering).`,
     "It was CHARGED and may still be rendering. Check the project grid and use flow_collect or flow_download once it appears. Do NOT resubmit — that is a second charge.",
   );
 }

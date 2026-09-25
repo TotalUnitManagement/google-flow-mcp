@@ -142,6 +142,20 @@ export async function listMedia(
   // after flow_open_project finds nothing. An empty project just times out.
   if (!/\/edit\//.test(page.url())) {
     await page.waitForSelector("flow-grid-tile-container", { timeout: 8_000 }).catch(() => undefined);
+    // A finished tile whose thumbnail is still loading was skipped as "not
+    // ready" (live: a listing returned 3 of 4 right after a load). Give the
+    // grid's thumbnails a moment; rendering tiles (NN%) are not waited for.
+    await page
+      .waitForFunction(
+        () =>
+          [...document.querySelectorAll<HTMLElement>("flow-grid-tile-container")]
+            .filter((t) => !/\b\d{1,3}%/.test(t.innerText))
+            .flatMap((t) => [...t.querySelectorAll<HTMLImageElement>("img")])
+            .every((i) => i.complete && i.naturalWidth > 0),
+        null,
+        { timeout: 5_000 },
+      )
+      .catch(() => undefined);
   }
   const entries: GridEntry[] = await page.evaluate(() => {
     const out: {
