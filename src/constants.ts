@@ -104,6 +104,9 @@ export const STOP_SIGNALS: { pattern: RegExp; reason: string }[] = [
     reason: "paywall or credit exhaustion",
   },
   { pattern: /unusual traffic|are you a robot|i'?m not a robot/i, reason: "bot challenge" },
+  // Seen on a failed generation tile, 2026-09-24: Flow's abuse detection. Stop and
+  // hand back to the human rather than generating into it.
+  { pattern: /noticed some unusual activity/i, reason: "Flow flagged unusual activity on the account" },
 ];
 
 /** Magic-byte signatures, so a 401 JSON body never gets saved as a .jpg. */
