@@ -50,6 +50,11 @@ export async function listMedia(
   offset = 0,
 ): Promise<{ items: MediaItem[]; total: number; unresolved: string[] }> {
   const page = await getFlowPage();
+  // The Angular grid renders after domcontentloaded; an immediate scan right
+  // after flow_open_project finds nothing. An empty project just times out.
+  if (!/\/edit\//.test(page.url())) {
+    await page.waitForSelector("flow-grid-tile-container", { timeout: 8_000 }).catch(() => undefined);
+  }
   const entries: GridEntry[] = await page.evaluate(() => {
     const out: {
       mediaId: string | null;

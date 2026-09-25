@@ -84,10 +84,29 @@ export async function exportScene(
 
     let buffer: Buffer | null = null;
     let via: "download" | "cdn" | "legacy" = "legacy";
+    let detail = "";
     if (first?.kind === "download") {
-      const tmp = await first.d.path().catch(() => null);
+      const d = first.d;
+      const tmp = await d.path().catch(() => null);
       if (tmp) buffer = await fs.readFile(tmp);
       via = "download";
+      if (!buffer) {
+        // Playwright had no file for it (failed, or cancelled). An http(s) url
+        // can still be fetched directly; a blob: url cannot leave the page.
+        const u = d.url();
+        if (/^https?:\/\//.test(u)) {
+          buffer = Buffer.from(await (await fetch(u, { redirect: "follow" })).arrayBuffer());
+        }
+        const shape = (() => {
+          try {
+            const p = new URL(u);
+            return p.protocol === "blob:" ? "blob:" : `${p.host}${p.pathname.slice(0, 60)}`;
+          } catch {
+            return "unparsable";
+          }
+        })();
+        detail = ` Download: file "${d.suggestedFilename()}", url ${shape}, failure ${(await d.failure().catch(() => null)) ?? "none"}.`;
+      }
     } else if (first?.kind === "cdn") {
       buffer = Buffer.from(await (await fetch(first.u, { redirect: "follow" })).arrayBuffer());
       via = "cdn";
@@ -97,7 +116,7 @@ export async function exportScene(
 
     if (!buffer || buffer.length < MIN_MEDIA_BYTES || buffer.subarray(4, 8).toString() !== "ftyp") {
       throw new FlowError(
-        `Scene export returned ${buffer?.length ?? 0} bytes that are not a valid MP4.`,
+        `Scene export (via ${via}) returned ${buffer?.length ?? 0} bytes that are not a valid MP4.${detail}`,
         "Nothing was written. The export may still be running — wait and retry, or download the scene in the browser.",
       );
     }
