@@ -397,18 +397,19 @@ server.registerTool(
 server.registerTool(
   "flow_export_scene",
   {
-    title: "Export the open scene editor",
+    title: "Export a scene",
     description:
-      "Export the open scene editor (flow_create_scene) to an MP4 on disk at original size. FREE — only the editor's 'Extend' costs credits, and this tool never uses it. The result reports how it arrived: 'download' (a browser download), 'cdn' (the clip file; verified for one-clip scenes), or 'legacy'. Multi-clip export on flow.google.com is not yet verified — check a 'cdn' result from a multi-clip scene before relying on it.",
+      "Export a scene (/scene/<id>) to an MP4 on disk via its 'Download scene' button. FREE — only 'Extend' costs credits, and this tool never uses it. Pass scene_id from flow_add_clips_to_scene, or run it while the browser is on the scene. A single clip's editor (/edit/<id>) is refused: its download is just that clip.",
     inputSchema: {
       out_file: z.string().describe("Output .mp4 path; relative paths resolve under FLOW_OUTPUT_DIR"),
+      scene_id: z.string().optional().describe("Scene id from flow_add_clips_to_scene; opens that scene first"),
       timeout_seconds: z.number().int().min(30).max(900).default(300),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
-  async ({ out_file, timeout_seconds }) => {
+  async ({ out_file, scene_id, timeout_seconds }) => {
     try {
-      const saved = await exportScene(out_file, timeout_seconds * 1000);
+      const saved = await exportScene(out_file, timeout_seconds * 1000, scene_id);
       return ok(
         `Exported scene (${saved.bytes.toLocaleString()} bytes) to ${saved.file}. Stitching is free; nothing charged.`,
         saved,
@@ -738,7 +739,11 @@ server.registerTool(
   async ({ media_ids }) => {
     try {
       const result = await addClipsToScene(media_ids);
-      const text = `Added ${result.added.length} clip(s)${result.failed.length ? `; failed: ${result.failed.join(", ")}` : ""}. Nothing charged.`;
+      const text =
+        `Added ${result.added.length} clip(s)${result.failed.length ? `; failed: ${result.failed.join(", ")}` : ""}. Nothing charged.` +
+        (result.sceneId
+          ? ` Now on scene ${result.sceneId}; export it with flow_export_scene (scene_id: ${result.sceneId}).`
+          : " Flow did not move to a /scene/ page; check the browser before exporting.");
       return ok(text, { ...result });
     } catch (err) {
       return fail(err);

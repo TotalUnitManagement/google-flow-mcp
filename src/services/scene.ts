@@ -1,10 +1,10 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { config } from "../config.js";
-import { KNOWN_PROCEDURES, MIN_MEDIA_BYTES, TIMEOUTS } from "../constants.js";
+import { KNOWN_PROCEDURES, MIN_MEDIA_BYTES, TIMEOUTS, projectUrl } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
-import { chooseOriginalSize, openVideoEditor } from "./media.js";
+import { openVideoEditor } from "./media.js";
 import { clickByText } from "./transport.js";
 
 /**
@@ -22,39 +22,53 @@ import { clickByText } from "./transport.js";
  */
 
 /**
- * Export the open scene editor (flow.google.com: /project/<p>/edit/<id>).
+ * Export a scene (flow.google.com: /project/<p>/scene/<id>).
  *
- * The editor's top-bar "Download media" menu offers "270p Animated GIF",
- * "360p Original size" and "720p Upscaled"; this picks "Original size". What
- * arrives is taken from whichever channel carries it, armed before the click:
- *   1. a browser download (Playwright's `download` event) — saved as-is;
- *   2. a flow-content.google/video request — observed for a one-clip scene,
- *      where the export IS the clip; fetched from Node (self-signed url);
- *   3. the legacy base64 concat payload, kept for older deployments.
- * A multi-clip export is not yet observed, which is why all three are armed.
- * Every result must be a real MP4 before anything is written.
+ * Observed 2026-09-24: a scene is its own media item. Adding a clip in a clip's
+ * editor (/edit/<id>) creates "Untitled Scene <date>" at /scene/<id>, whose top
+ * bar has a plain "Download scene" button. A clip editor's "Download media"
+ * menu downloads ONLY that clip — live, a two-clip "export" from there came back
+ * byte-identical to clip 1 — so a clip editor is refused here, not exported.
+ *
+ * The file is taken from a browser download (Playwright's `download` event), or
+ * the legacy base64 concat payload. There is deliberately NO flow-content CDN
+ * channel: the scene's player loads individual clip files from there, and one of
+ * those is exactly the wrong file. Every result must be a real MP4 before
+ * anything is written.
  */
 export async function exportScene(
   outFile: string,
   timeoutMs = TIMEOUTS.exportMs,
-): Promise<{ file: string; bytes: number; via: "download" | "cdn" | "legacy" }> {
+  sceneId?: string,
+): Promise<{ file: string; bytes: number; via: "download" | "legacy"; sceneId: string }> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
 
-  if (!/\/(edit|scene)\//.test(page.url())) {
+  if (sceneId) {
+    const project = /\/project\/([A-Za-z0-9_-]+)/.exec(page.url())?.[1];
+    if (!project) {
+      throw new FlowError("No Flow project is open.", "Open one with flow_open_project first. Nothing was charged.");
+    }
+    await page.goto(`${projectUrl(project)}/scene/${sceneId}`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(3_000);
+  }
+
+  if (/\/edit\//.test(page.url())) {
     throw new FlowError(
-      "The browser is not in a scene editor.",
-      "Open one with flow_create_scene (it opens a clip's editor), then retry. Nothing was charged.",
+      "This is a single clip's editor, not a scene: its download is that one clip.",
+      "Add clips with flow_add_clips_to_scene, which moves to the new scene (/scene/<id>), or pass that scene_id here. Nothing was charged.",
+    );
+  }
+  const currentScene = /\/scene\/([0-9a-f-]{36})/.exec(page.url())?.[1];
+  if (!currentScene) {
+    throw new FlowError(
+      "The browser is not on a scene.",
+      "Pass scene_id (from flow_add_clips_to_scene), or open the scene in the browser. Nothing was charged.",
     );
   }
 
-  // Arm every channel BEFORE clicking, or a fast export finishes unobserved.
+  // Arm before clicking, or a fast export finishes unobserved.
   const download = page.waitForEvent("download", { timeout: timeoutMs }).catch(() => null);
-  let cdnUrl: string | null = null;
-  const onRequest = (req: import("playwright-core").Request) => {
-    if (!cdnUrl && /flow-content\.google\/video\/[0-9a-f-]{36}/.test(req.url())) cdnUrl = req.url();
-  };
-  page.on("request", onRequest);
   const legacy = page
     .waitForResponse(
       (res) =>
@@ -64,77 +78,103 @@ export async function exportScene(
     )
     .catch(() => null);
 
-  try {
-    await chooseOriginalSize();
+  await clickDownloadScene();
 
-    const target = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
-    await fs.mkdir(path.dirname(target), { recursive: true });
+  const target = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
+  await fs.mkdir(path.dirname(target), { recursive: true });
 
-    let first = await Promise.race([
-      download.then((d) => (d ? ({ kind: "download", d } as const) : null)),
-      waitFor(() => cdnUrl, timeoutMs).then((u) => (u ? ({ kind: "cdn", u } as const) : null)),
-    ]);
-    // The editor's player also loads clips from flow-content.google, so a CDN hit
-    // may be ONE clip of a multi-clip scene rather than the export. Give a real
-    // browser download a grace period to arrive and prefer it when it does.
-    if (first?.kind === "cdn") {
-      const late = await Promise.race([download, new Promise<null>((r) => setTimeout(() => r(null), 15_000))]);
-      if (late) first = { kind: "download", d: late };
-    }
-
-    let buffer: Buffer | null = null;
-    let via: "download" | "cdn" | "legacy" = "legacy";
-    let detail = "";
-    if (first?.kind === "download") {
-      const d = first.d;
-      const tmp = await d.path().catch(() => null);
-      if (tmp) buffer = await fs.readFile(tmp);
-      via = "download";
-      if (!buffer) {
-        // Playwright had no file for it (failed, or cancelled). An http(s) url
-        // can still be fetched directly; a blob: url cannot leave the page.
-        const u = d.url();
-        if (/^https?:\/\//.test(u)) {
-          buffer = Buffer.from(await (await fetch(u, { redirect: "follow" })).arrayBuffer());
-        }
-        const shape = (() => {
-          try {
-            const p = new URL(u);
-            return p.protocol === "blob:" ? "blob:" : `${p.host}${p.pathname.slice(0, 60)}`;
-          } catch {
-            return "unparsable";
-          }
-        })();
-        detail = ` Download: file "${d.suggestedFilename()}", url ${shape}, failure ${(await d.failure().catch(() => null)) ?? "none"}.`;
+  const d = await download;
+  let buffer: Buffer | null = null;
+  let via: "download" | "legacy" = "legacy";
+  let detail = "";
+  if (d) {
+    via = "download";
+    const tmp = await d.path().catch(() => null);
+    if (tmp) buffer = await fs.readFile(tmp);
+    if (!buffer) {
+      // Playwright had no file for it (failed, or cancelled). An http(s) url can
+      // still be fetched directly; a blob: url cannot leave the page.
+      const u = d.url();
+      if (/^https?:\/\//.test(u)) {
+        buffer = Buffer.from(await (await fetch(u, { redirect: "follow" })).arrayBuffer());
       }
-    } else if (first?.kind === "cdn") {
-      buffer = Buffer.from(await (await fetch(first.u, { redirect: "follow" })).arrayBuffer());
-      via = "cdn";
-    } else {
-      buffer = Buffer.from(await pollForEncodedVideo(legacy, timeoutMs), "base64");
+      const shape = (() => {
+        try {
+          const p = new URL(u);
+          return p.protocol === "blob:" ? "blob:" : `${p.host}${p.pathname.slice(0, 60)}`;
+        } catch {
+          return "unparsable";
+        }
+      })();
+      detail = ` Download: file "${d.suggestedFilename()}", url ${shape}, failure ${(await d.failure().catch(() => null)) ?? "none"}.`;
     }
-
-    if (!buffer || buffer.length < MIN_MEDIA_BYTES || buffer.subarray(4, 8).toString() !== "ftyp") {
-      throw new FlowError(
-        `Scene export (via ${via}) returned ${buffer?.length ?? 0} bytes that are not a valid MP4.${detail}`,
-        "Nothing was written. The export may still be running — wait and retry, or download the scene in the browser.",
-      );
-    }
-    await fs.writeFile(target, buffer);
-    return { file: target, bytes: buffer.length, via };
-  } finally {
-    page.off("request", onRequest);
+  } else {
+    buffer = Buffer.from(await pollForEncodedVideo(legacy, timeoutMs), "base64");
   }
+
+  if (!buffer || buffer.length < MIN_MEDIA_BYTES || buffer.subarray(4, 8).toString() !== "ftyp") {
+    throw new FlowError(
+      `Scene export (via ${via}) returned ${buffer?.length ?? 0} bytes that are not a valid MP4.${detail}`,
+      "Nothing was written. The export may still be running — wait and retry, or download the scene in the browser.",
+    );
+  }
+  await fs.writeFile(target, buffer);
+  return { file: target, bytes: buffer.length, via, sceneId: currentScene };
 }
 
-async function waitFor<T>(probe: () => T | null, timeoutMs: number): Promise<T | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const v = probe();
-    if (v) return v;
-    await new Promise((r) => setTimeout(r, 250));
+/**
+ * Click the scene's "Download scene". Observed as a plain button; if a later
+ * release turns it into a menu, pick "Original size". A dialog that mentions
+ * credits stops the export without clicking anything in it.
+ */
+async function clickDownloadScene(): Promise<void> {
+  const page = await getFlowPage();
+  const clicked = await page.evaluate(() => {
+    document.querySelector<HTMLElement>(".cdk-overlay-backdrop")?.click(); // leftover picker/popover
+    const visible = [...document.querySelectorAll<HTMLElement>("button")].filter(
+      (b) => b.getClientRects().length > 0 && !b.closest(".cdk-overlay-container"),
+    );
+    const btn = visible.find((b) => (b.getAttribute("aria-label") ?? "").trim() === "Download scene");
+    if (!btn) {
+      return {
+        ok: false,
+        seen: [...new Set(visible.map((b) => (b.getAttribute("aria-label") ?? "").trim()).filter(Boolean))].slice(
+          0,
+          40,
+        ),
+      };
+    }
+    btn.click();
+    return { ok: true, seen: [] as string[] };
+  });
+  if (!clicked.ok) {
+    throw new FlowError(
+      `Could not find the scene's "Download scene" button. Visible buttons: ${clicked.seen.join(" | ") || "(none)"}`,
+      "Flow's scene view may have changed — see references/ui-playbook.md. Nothing was charged.",
+    );
   }
-  return null;
+  await page.waitForTimeout(900);
+  const followUp = await page.evaluate(() => {
+    const panes = [
+      ...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane,[role=dialog],[role=alertdialog]"),
+    ].filter((p) => p.getClientRects().length > 0);
+    const text = panes.map((p) => p.innerText.replace(/\s+/g, " ").trim()).join(" | ");
+    if (/credit/i.test(text)) return { kind: "credit", text };
+    const original = panes
+      .flatMap((p) => [...p.querySelectorAll<HTMLElement>("[role=menuitem],button")])
+      .find((e) => /Original size/i.test(e.innerText) && e.getAttribute("aria-disabled") !== "true");
+    if (original) {
+      original.click();
+      return { kind: "menu", text };
+    }
+    return { kind: "none", text };
+  });
+  if (followUp.kind === "credit") {
+    throw new FlowError(
+      `Downloading the scene showed a prompt that mentions credits: "${followUp.text.slice(0, 200)}"`,
+      "Nothing was clicked in it and nothing was charged. Exporting a scene should be free; check it in the browser.",
+    );
+  }
 }
 
 /**
@@ -205,7 +245,9 @@ export async function createScene(firstClipMediaId: string): Promise<{ sceneId: 
  * UNVERIFIED on flow.google.com: the clip picker that "Add clip" opens has not
  * been observed; options are matched by media id or by the clip's /asb/ token.
  */
-export async function addClipsToScene(mediaIds: string[]): Promise<{ added: string[]; failed: string[] }> {
+export async function addClipsToScene(
+  mediaIds: string[],
+): Promise<{ added: string[]; failed: string[]; sceneId: string | null; url: string }> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
 
@@ -257,7 +299,11 @@ export async function addClipsToScene(mediaIds: string[]): Promise<{ added: stri
     added.push(mediaId);
   }
 
-  return { added, failed };
+  // Adding to a clip's editor creates a separate scene item and moves to it
+  // (/scene/<id>); that id is what flow_export_scene needs.
+  await page.waitForURL(/\/scene\//, { timeout: 10_000 }).catch(() => undefined);
+  const sceneId = /\/scene\/([0-9a-f-]{36})/.exec(page.url())?.[1] ?? null;
+  return { added, failed, sceneId, url: page.url() };
 }
 
 /**
