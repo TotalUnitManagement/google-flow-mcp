@@ -180,16 +180,17 @@ paths and `/fx/api/auth/session` are gone.
 - **Scene export:** the scene's top bar has a plain `button[aria-label="Download scene"]`
   (not a menu). The stitched MP4 (here 8.0s, 640x360, video+audio, ~7.8 MB) is built
   in the page and downloaded from a `blob:` url that neither `download.saveAs()`
-  nor in-page hooks could reach. **The server's Chrome exits partway through
-  that download, every time** — cause unknown — leaving the complete file as an
-  unrenamed `.crdownload`. It is a **Chrome browser-process crash**, not Flow:
-  a Crashpad dump lands in `<profile>/Crashpad/reports` on every export, each an
-  `EXCEPTION_ACCESS_VIOLATION` at the same `chrome.dll+0x2f199a` (Chrome stable,
-  2026-09-24). It happens with Playwright's own download handling and with CDP
-  download behavior set to either `allowAndName` or `allow`. The next tool call
-  relaunches the browser; the Flow sign-in survives. The server points Chrome's downloads at
-  `<stateDir>/downloads` via CDP `Browser.setDownloadBehavior` and takes the
-  file once it is stable and `isCompleteMp4()`.
+  nor in-page hooks could reach. The server points Chrome's downloads at
+  `<stateDir>/downloads` via CDP `Browser.setDownloadBehavior` (`allow`) and
+  takes the file once it is stable and `isCompleteMp4()`.
+- **⚠️ Never launch with Playwright's `acceptDownloads: true`.** With it on,
+  Chrome crashed at the completion of every Flow download — scene exports and
+  the clip lookup's cancelled download alike — each a Crashpad dump in
+  `<profile>/Crashpad/reports`: `EXCEPTION_ACCESS_VIOLATION` at the same
+  `chrome.dll+0x2f199a` (Chrome stable, 2026-09-24). No dump before it was
+  added, one on every download after, none again once it was removed. Without
+  it, Playwright refuses downloads (what the clip lookup wants) and the scene
+  export's CDP download completes cleanly.
 - **⚠️ Timeline "+"** (`aria-label="Add clip"`) opens a popover with exactly two
   items: "Add clip" and **"Extend (Veo 3.1 - Lite)" — charged**. Never navigate it
   with arrow keys; click the item whose whole label is "Add clip" and nothing else.

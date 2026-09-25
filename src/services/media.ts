@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import type { Page } from "playwright-core";
 import { config } from "../config.js";
-import { FILE_SIGNATURES, MIN_MEDIA_BYTES, isFlowUrl } from "../constants.js";
+import { FILE_SIGNATURES, MIN_MEDIA_BYTES, isFlowUrl, projectUrl } from "../constants.js";
 import { FlowError, type MediaItem } from "../types.js";
 import { getFlowPage, reloadSession } from "./browser.js";
 
@@ -17,18 +18,103 @@ import { getFlowPage, reloadSession } from "./browser.js";
  * the clip's) and loads the clip from flow-content.google/video/<mediaId>?…, so
  * that request is where the id comes from.
  *
- * STOPGAP KEYING. The /asb/ tokens are re-issued on every grid load, so they
+ * FALLBACK KEYING, used only when the media-list RPC (below) did not pair a
+ * tile. The /asb/ tokens are re-issued on every grid load, so they
  * cannot identify a tile across the navigation that opening it requires. Tiles
  * are keyed by "<name>#<ordinal counted from the END of the finished video
  * tiles>": new clips appear at the front, so from-the-end ordinals survive them,
  * and the name is re-checked on every open. A deletion shifts ordinals, and two
- * same-named clips rely on ordinal alone — replace this with ids read from the
- * grid's own data RPC.
+ * same-named clips rely on ordinal alone.
  */
 const videoTiles = new Map<string, { mediaId: string; url: string }>();
 
+/**
+ * PRIMARY LOOKUP (observed 2026-09-24): the grid renders from a batchexecute
+ * media-list response (rpc `Zzl0ze` at the time) whose entries look like
+ * `[<mediaId>, _, <editId>, _, _, [.., .., .., .., .., "<asb thumbnail url>", ..], ..]`
+ * — the same /asb/ token the tile shows, so token -> ids is exact for the load
+ * that rendered the grid. Refreshed on every load, since tokens are re-issued.
+ */
+const rpcByToken = new Map<string, { mediaId: string; editId: string | null }>();
+const editByMedia = new Map<string, string>();
+const watchedPages = new WeakSet<Page>();
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Pair thumbnail tokens with media (and editor) ids from a batchexecute body.
+ * Any array whose first element is a uuid owns the /asb/ tokens found within
+ * three levels of it; its third element, when a uuid, is the editor id. A
+ * token claimed by two different ids is dropped as ambiguous.
+ * @internal exported for unit tests
+ */
+export function pairTokensFromRpc(body: string): { token: string; mediaId: string; editId: string | null }[] {
+  const payloads: unknown[] = [];
+  for (const line of body.replace(/^\)\]\}'\s*/, "").split("\n")) {
+    const s = line.trim();
+    if (!s.startsWith("[")) continue;
+    try {
+      const chunk = JSON.parse(s) as unknown[];
+      for (const entry of chunk) {
+        if (Array.isArray(entry) && entry[0] === "wrb.fr" && typeof entry[2] === "string") {
+          try {
+            payloads.push(JSON.parse(entry[2]));
+          } catch {
+            /* not JSON */
+          }
+        }
+      }
+    } catch {
+      /* not a JSON line */
+    }
+  }
+
+  const owner = new Map<string, { mediaId: string; editId: string | null } | null>();
+  const tokensWithin = (v: unknown, depth: number, out: string[]) => {
+    if (typeof v === "string") {
+      const t = /\/asb\/([^=?/"]+)/.exec(v)?.[1];
+      if (t) out.push(t);
+    } else if (Array.isArray(v) && depth > 0) {
+      for (const x of v) tokensWithin(x, depth - 1, out);
+    }
+  };
+  const visit = (v: unknown) => {
+    if (!Array.isArray(v)) return;
+    if (typeof v[0] === "string" && UUID.test(v[0])) {
+      const mediaId = v[0];
+      const editId = typeof v[2] === "string" && UUID.test(v[2]) ? v[2] : null;
+      const tokens: string[] = [];
+      for (const x of v.slice(1)) tokensWithin(x, 3, tokens);
+      for (const token of new Set(tokens)) {
+        const prev = owner.get(token);
+        if (prev === undefined) owner.set(token, { mediaId, editId });
+        else if (prev && prev.mediaId !== mediaId) owner.set(token, null); // ambiguous
+      }
+    }
+    for (const x of v) visit(x);
+  };
+  payloads.forEach(visit);
+
+  return [...owner.entries()].filter(([, o]) => o !== null).map(([token, o]) => ({ token, ...o! }));
+}
+
+/** Record every media-list pairing the page receives. Idempotent per page. */
+function watchGridRpc(page: Page): void {
+  if (watchedPages.has(page)) return;
+  watchedPages.add(page);
+  page.on("response", async (res) => {
+    if (!/\/data\/batchexecute/.test(res.url())) return;
+    const body = await res.text().catch(() => "");
+    for (const p of pairTokensFromRpc(body)) {
+      rpcByToken.set(p.token, { mediaId: p.mediaId, editId: p.editId });
+      if (p.editId) editByMedia.set(p.mediaId, p.editId);
+    }
+  });
+}
+
 interface GridEntry {
   mediaId: string | null;
+  token: string | null;
   key: string | null;
   kind: "image" | "video";
   name: string | null;
@@ -48,8 +134,10 @@ interface GridEntry {
 export async function listMedia(
   limit = 50,
   offset = 0,
+  retried = false,
 ): Promise<{ items: MediaItem[]; total: number; unresolved: string[] }> {
   const page = await getFlowPage();
+  watchGridRpc(page);
   // The Angular grid renders after domcontentloaded; an immediate scan right
   // after flow_open_project finds nothing. An empty project just times out.
   if (!/\/edit\//.test(page.url())) {
@@ -58,6 +146,7 @@ export async function listMedia(
   const entries: GridEntry[] = await page.evaluate(() => {
     const out: {
       mediaId: string | null;
+      token: string | null;
       key: string | null;
       kind: "image" | "video";
       name: string | null;
@@ -84,6 +173,7 @@ export async function listMedia(
         const img = el.querySelector<HTMLImageElement>("img.thumbnail")!;
         out.push({
           mediaId: null,
+          token: /\/asb\/([^=?/]+)/.exec(img.src)?.[1] ?? null,
           key: `${name}#${videos.length - 1 - i}`,
           kind: "video",
           name: name || null,
@@ -107,6 +197,7 @@ export async function listMedia(
       const isVideo = el instanceof HTMLVideoElement || /\/video\//.test(src) || !!tile?.querySelector("video");
       out.push({
         mediaId: id,
+        token: null,
         key: null,
         kind: isVideo ? "video" : "image",
         name: el.getAttribute("alt") ?? tile?.getAttribute("aria-label") ?? null,
@@ -116,10 +207,20 @@ export async function listMedia(
     return out;
   });
 
+  // The media-list response that rendered this grid may have arrived before the
+  // watcher existed (first call on a page). One free reload replays it.
+  const window_ = entries.slice(offset, offset + limit);
+  if (!retried && window_.some((e) => !e.mediaId && e.token && !rpcByToken.has(e.token))) {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => null);
+    await page.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
+    await page.waitForTimeout(1_500); // let the response handler finish parsing
+    return listMedia(limit, offset, true);
+  }
+
   const items: MediaItem[] = [];
   const unresolved: string[] = [];
-  for (const e of entries.slice(offset, offset + limit)) {
-    let mediaId = e.mediaId;
+  for (const e of window_) {
+    let mediaId = e.mediaId ?? (e.token ? (rpcByToken.get(e.token)?.mediaId ?? null) : null);
     if (!mediaId && e.key) {
       const key = e.key;
       const hit =
@@ -144,7 +245,6 @@ export async function listMedia(
 async function openVideoTile(key: string, stay = false): Promise<{ mediaId: string; url: string; editUrl: string }> {
   const page = await getFlowPage();
   const gridUrl = page.url();
-  const re = /flow-content\.google\/video\/[0-9a-f-]{36}/;
 
   // After a return to the grid its thumbnails reload, so wait for the tile.
   let mark: number | null = null;
@@ -176,12 +276,39 @@ async function openVideoTile(key: string, stay = false): Promise<{ mediaId: stri
     throw new FlowError(`No video tile matches ${key} any more.`, "Open the project's All media view and retry.");
   }
 
-  // The editor does not load the clip on open, nor on Play (it decodes off the
-  // main thread; observed 2026-09-24). What reliably fetches it is the editor's
-  // own Download media -> "Original size", which for a single clip is the clip
-  // file itself: a flow-content.google/video/<id> request and a browser
-  // download of that url. Read the url from either and cancel the download.
   await page.waitForURL(/\/edit\//, { timeout: 20_000 }).catch(() => undefined);
+  const url = await captureClipUrl();
+  void mark;
+
+  const editUrl = page.url();
+  if (!stay && page.url() !== gridUrl) {
+    await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
+    if (page.url() !== gridUrl) await page.goto(gridUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
+  }
+
+  const mediaId = url ? /\/video\/([0-9a-f-]{36})/.exec(url)?.[1] : undefined;
+  if (!url || !mediaId) {
+    throw new FlowError(
+      "Opened the video but never saw its flow-content.google/video request.",
+      "Nothing was charged. Flow's player may have changed; see references/ui-playbook.md.",
+    );
+  }
+  videoTiles.set(key, { mediaId, url });
+  return { mediaId, url, editUrl };
+}
+
+/**
+ * In a clip's editor, read the clip's signed flow-content.google/video url.
+ * The editor does not load the clip on open, nor on Play (it decodes off the
+ * main thread; observed 2026-09-24). What reliably fetches it is the editor's
+ * own Download media -> "Original size", which for a single clip is the clip
+ * file itself: a flow-content.google/video/<id> request and a browser download
+ * of that url. Read the url from either and cancel the download.
+ */
+async function captureClipUrl(): Promise<string | null> {
+  const page = await getFlowPage();
+  const re = /flow-content\.google\/video\/[0-9a-f-]{36}/;
   let url: string | null = null;
   const onRequest = (r: import("playwright-core").Request) => {
     if (!url && re.test(r.url())) url = r.url();
@@ -208,24 +335,28 @@ async function openVideoTile(key: string, stay = false): Promise<{ mediaId: stri
     page.off("request", onRequest);
     page.off("download", onDownload);
   }
-  void mark;
+  return url;
+}
 
-  const editUrl = page.url();
-  if (!stay && page.url() !== gridUrl) {
-    await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
-    if (page.url() !== gridUrl) await page.goto(gridUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+/**
+ * Go straight to a clip's editor by the editor id from the media-list RPC, read
+ * the clip url there, and (unless `stay`) return to where the page was. No tile
+ * clicking, so no name/position keying.
+ */
+async function openEditor(editId: string, stay: boolean): Promise<{ url: string | null; editUrl: string }> {
+  const page = await getFlowPage();
+  const from = page.url();
+  const project = /\/project\/([A-Za-z0-9_-]+)/.exec(from)?.[1];
+  if (!project) throw new FlowError("No Flow project is open.", "Open one with flow_open_project first.");
+  const editUrl = `${projectUrl(project)}/edit/${editId}`;
+  await page.goto(editUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  await page.waitForTimeout(2_500);
+  const url = stay ? null : await captureClipUrl();
+  if (!stay && page.url() !== from) {
+    await page.goto(from, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
   }
-
-  const mediaId = url ? /\/video\/([0-9a-f-]{36})/.exec(url)?.[1] : undefined;
-  if (!url || !mediaId) {
-    throw new FlowError(
-      "Opened the video but never saw its flow-content.google/video request.",
-      "Nothing was charged. Flow's player may have changed; see references/ui-playbook.md.",
-    );
-  }
-  videoTiles.set(key, { mediaId, url });
-  return { mediaId, url, editUrl };
+  return { url, editUrl };
 }
 
 /** Open the editor's top-bar "Download media" menu and pick "Original size". Free. */
@@ -289,8 +420,20 @@ export async function openVideoEditor(mediaId: string): Promise<{ editId: string
     await start.goto(start.url().replace(/\/edit\/.*$/, ""), { waitUntil: "domcontentloaded", timeout: 60_000 });
     await start.waitForSelector("flow-grid-tile-container", { timeout: 15_000 }).catch(() => undefined);
   }
+  // Primary: the editor id from the media-list RPC — no tile clicking at all.
+  if (!editByMedia.has(mediaId)) await listMedia(500, 0);
+  const editId = editByMedia.get(mediaId);
+  if (editId) {
+    const { editUrl } = await openEditor(editId, true);
+    const page = await getFlowPage();
+    if (!/\/edit\//.test(page.url())) {
+      throw new FlowError("Opened the clip but the editor did not load.", "Check the browser. Nothing was charged.");
+    }
+    return { editId, url: editUrl };
+  }
+
+  // Fallback: the stopgap name/ordinal key.
   const keyFor = () => [...videoTiles.entries()].find(([, v]) => v.mediaId === mediaId)?.[0];
-  if (!keyFor()) await listMedia(500, 0);
   const key = keyFor();
   if (!key) {
     throw new FlowError(
@@ -300,11 +443,11 @@ export async function openVideoEditor(mediaId: string): Promise<{ editId: string
   }
   const page = await getFlowPage();
   const { editUrl } = await openVideoTile(key, true);
-  const editId = /\/edit\/([0-9a-f-]{36})/.exec(editUrl)?.[1];
-  if (!editId || !/\/edit\//.test(page.url())) {
+  const openedId = /\/edit\/([0-9a-f-]{36})/.exec(editUrl)?.[1];
+  if (!openedId || !/\/edit\//.test(page.url())) {
     throw new FlowError("Opened the clip but the editor did not load.", "Check the browser. Nothing was charged.");
   }
-  return { editId, url: page.url() };
+  return { editId: openedId, url: page.url() };
 }
 
 /**
@@ -315,6 +458,12 @@ export async function openVideoEditor(mediaId: string): Promise<{ editId: string
  */
 export async function resolveMediaUrl(mediaId: string): Promise<string> {
   const page = await getFlowPage();
+  // Primary: straight to the clip's editor by its RPC editor id, for a fresh url.
+  const editId = editByMedia.get(mediaId);
+  if (editId) {
+    const { url } = await openEditor(editId, false).catch(() => ({ url: null }));
+    if (url && url.includes(mediaId)) return url;
+  }
   const key = [...videoTiles.entries()].find(([, v]) => v.mediaId === mediaId)?.[0];
   if (key) {
     const fresh = await openVideoTile(key).catch(() => null);

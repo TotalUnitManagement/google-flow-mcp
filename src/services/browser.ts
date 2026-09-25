@@ -49,9 +49,10 @@ async function connect(): Promise<BrowserContext> {
       headless: config.headless,
       channel: config.channel,
       viewport: { width: 1440, height: 900 },
-      // Scene exports arrive as in-page (blob:) downloads; without this Playwright
-      // reports the download but keeps no file.
-      acceptDownloads: true,
+      // No acceptDownloads: with it on, Chrome completes Flow's downloads and
+      // crashes at completion (EXCEPTION_ACCESS_VIOLATION at chrome.dll+0x2f199a,
+      // every time, 2026-09-24). Clip lookups want the download refused anyway;
+      // scene exports route their one download through CDP (see scene.ts).
       args: ["--disable-blink-features=AutomationControlled"],
     });
     browser = null;
