@@ -108,6 +108,16 @@ async function typePrompt(prompt: string): Promise<void> {
   }
 }
 
+async function promptStillTyped(prompt: string): Promise<boolean> {
+  const page = await getFlowPage();
+  const typed = await page
+    .locator(composerHandle())
+    .last()
+    .innerText()
+    .catch(() => "");
+  return typed.trim().length >= Math.min(prompt.trim().length, 20);
+}
+
 async function progressTileCount(): Promise<number> {
   const page = await getFlowPage();
   return page.evaluate(() => (document.body.innerText.match(/^\s*\d{1,3}%\s*$/gm) ?? []).length);
@@ -126,7 +136,24 @@ async function send(): Promise<void> {
     return true;
   });
   if (!clicked) {
-    throw new FlowError("Could not find an enabled Start generation button.", "Nothing was sent or charged.");
+    const state = await page
+      .evaluate(() => {
+        const ed = document.querySelector<HTMLElement>('.ProseMirror[contenteditable="true"]');
+        let scope: HTMLElement | null = ed;
+        for (let k = 0; k < 8 && scope?.parentElement; k++) scope = scope.parentElement;
+        const buttons = [...document.querySelectorAll<HTMLButtonElement>('button[aria-label="Start generation"]')]
+          .map((b) => `${b.offsetParent ? "visible" : "hidden"}/${b.disabled ? "disabled" : "enabled"}`)
+          .join(", ");
+        const overlays = [...document.querySelectorAll<HTMLElement>(".cdk-overlay-pane")]
+          .filter((p) => p.getClientRects().length > 0)
+          .map((p) => p.innerText.replace(/\s+/g, " ").trim().slice(0, 60));
+        return `prompt ${ed?.innerText.trim().length ?? "missing"} chars; send buttons [${buttons || "none"}]; open overlays [${overlays.join(" | ")}]; composer ends "${(scope?.innerText ?? "").replace(/\s+/g, " ").trim().slice(-80)}"`;
+      })
+      .catch(() => "unreadable");
+    throw new FlowError(
+      `Could not find an enabled Start generation button (${state}).`,
+      "Nothing was sent or charged.",
+    );
   }
 
   for (let i = 0; i < 10; i++) {
@@ -203,6 +230,13 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
   const notes: string[] = [];
   const balanceBefore = await preflight();
   await assertNoStopSignal();
+
+  // Snapshot the library FIRST. Listing can reload the page (to capture the
+  // grid's media-list RPC) or open clip editors (fallback lookup); either wipes
+  // the composer. Taken after typing, it emptied the prompt before send — live,
+  // a still refused with "prompt 0 chars", and a Frames video went out blank.
+  const { items: beforeItems } = await listMedia(500, 0);
+  const before = new Set(beforeItems.map((i) => i.mediaId));
 
   // Reset the composer so no stale prompt or frame chip leaks into this call.
   await clearAttachments();
@@ -311,8 +345,23 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
     };
   }
 
-  const { items: beforeItems } = await listMedia(500, 0);
-  const before = new Set(beforeItems.map((i) => i.mediaId));
+  // Last check before the one irreversible click: the prompt must still be in
+  // the box. The quote read above depends on settings, not on the prompt text,
+  // so re-typing does not invalidate it.
+  if (!(await promptStillTyped(opts.prompt))) {
+    await typePrompt(opts.prompt);
+    if (!(await promptStillTyped(opts.prompt))) {
+      await refuse(
+        new FlowError(
+          "The prompt box was emptied before send and could not be refilled.",
+          "Nothing was sent or charged.",
+        ),
+        "rejected",
+        "prompt lost before send",
+      );
+    }
+    notes.push("The prompt box had been emptied before send; re-typed and verified.");
+  }
 
   await send();
   const charged = quote as number;

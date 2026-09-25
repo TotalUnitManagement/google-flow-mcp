@@ -97,8 +97,17 @@ async function openSettings(): Promise<void> {
 
 async function closeSettings(): Promise<void> {
   const page = await getFlowPage();
+  // Backdrop click first. Escape (the old way) could reach the prompt box: live,
+  // the prompt was typed and verified, then read 0 chars at send time.
   for (let i = 0; i < 3 && (await settingsPaneOpen()); i++) {
-    await page.keyboard.press("Escape").catch(() => {});
+    const clicked = await page
+      .evaluate(() => {
+        const backdrop = document.querySelector<HTMLElement>(".cdk-overlay-backdrop");
+        backdrop?.click();
+        return Boolean(backdrop);
+      })
+      .catch(() => false);
+    if (!clicked) await page.keyboard.press("Escape").catch(() => {});
     for (let k = 0; k < 8 && (await settingsPaneOpen()); k++) await page.waitForTimeout(150);
   }
 }
