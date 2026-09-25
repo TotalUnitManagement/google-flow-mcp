@@ -173,6 +173,18 @@ paths and `/fx/api/auth/session` are gone.
   clip). On a **one-clip** scene, "360p Original size" fires one batchexecute
   (`rpcids=WuwhI`) then GETs `flow-content.google/video/<clip id>?Expires…` — the
   clip file itself, no stitch job. A multi-clip export is still unobserved.
+- **Scenes are their own items** (observed 2026-09-24). Adding a clip in a
+  clip's editor creates "Untitled Scene <date>" at `/project/<p>/scene/<id>` and
+  moves there. A clip editor's "Download media" only ever downloads that clip —
+  a two-clip "export" from there was byte-identical to clip 1.
+- **Scene export:** the scene's top bar has a plain `button[aria-label="Download scene"]`
+  (not a menu). The stitched MP4 (here 8.0s, 640x360, video+audio, ~7.8 MB) is built
+  in the page and downloaded from a `blob:` url that neither `download.saveAs()`
+  nor in-page hooks could reach. **The server's Chrome exits partway through
+  that download, every time** — cause unknown — leaving the complete file as an
+  unrenamed `.crdownload`. The server points Chrome's downloads at
+  `<stateDir>/downloads` via CDP `Browser.setDownloadBehavior` and takes the
+  file once it is stable and `isCompleteMp4()`.
 - **⚠️ Timeline "+"** (`aria-label="Add clip"`) opens a popover with exactly two
   items: "Add clip" and **"Extend (Veo 3.1 - Lite)" — charged**. Never navigate it
   with arrow keys; click the item whose whole label is "Add clip" and nothing else.
