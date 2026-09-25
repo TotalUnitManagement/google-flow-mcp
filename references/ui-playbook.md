@@ -141,6 +141,10 @@ paths and `/fx/api/auth/session` are gone.
 - **Composer:** `.ProseMirror[contenteditable=true]`. Send is `button[aria-label="Start generation"]`.
 - **Agent vs direct:** `button.agent-mode-chip[aria-pressed]`. The server runs in
   direct mode (`aria-pressed=false`): no proposal card, charged on send.
+- **⚠️ The settings popover swallows sends** (observed 2026-09-24). It has no
+  `.cdk-overlay-backdrop`, and while it is open a click on "Start generation" does
+  nothing: the prompt stays in the box. Close it by clicking "Settings trigger"
+  again (a toggle) before sending, never with Escape, which can reach the prompt.
 - **Cost gate:** the popover behind `button[aria-label="Settings trigger"]` states
   `Generating will use N credits` for exactly what is in the composer. Read it
   after typing the prompt and attaching frames, before pressing send.

@@ -6,6 +6,7 @@ import {
   attachFrames,
   attachMedia,
   clearAttachments,
+  closeSettings,
   ensureDirectMode,
   readSettings,
 } from "./compose.js";
@@ -126,6 +127,8 @@ async function progressTileCount(): Promise<number> {
 /** Press send once, and confirm Flow accepted it. Never presses twice. */
 async function send(): Promise<void> {
   const page = await getFlowPage();
+  // An open settings popover swallows the send click (observed 2026-09-24).
+  await closeSettings();
   const progressBefore = await progressTileCount();
   const clicked = await page.evaluate(() => {
     const btn = [...document.querySelectorAll<HTMLElement>('button[aria-label="Start generation"]')].find(

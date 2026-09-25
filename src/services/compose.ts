@@ -95,20 +95,36 @@ async function openSettings(): Promise<void> {
   );
 }
 
-async function closeSettings(): Promise<void> {
+export async function closeSettings(): Promise<void> {
   const page = await getFlowPage();
-  // Backdrop click first. Escape (the old way) could reach the prompt box: live,
-  // the prompt was typed and verified, then read 0 chars at send time.
+  // Observed 2026-09-24: this popover has NO .cdk-overlay-backdrop, and while it
+  // is open a click on "Start generation" does nothing — the send is swallowed
+  // and the prompt stays in the box. It closes reliably by clicking its own
+  // "Settings trigger" again (a toggle). Escape is the last resort only: it can
+  // reach the prompt box.
   for (let i = 0; i < 3 && (await settingsPaneOpen()); i++) {
-    const clicked = await page
+    const how = await page
       .evaluate(() => {
+        const trigger = [...document.querySelectorAll<HTMLElement>('button[aria-label="Settings trigger"]')].find(
+          (b) => b.getClientRects().length > 0,
+        );
+        if (trigger) {
+          trigger.click();
+          return "trigger";
+        }
         const backdrop = document.querySelector<HTMLElement>(".cdk-overlay-backdrop");
         backdrop?.click();
-        return Boolean(backdrop);
+        return backdrop ? "backdrop" : "none";
       })
-      .catch(() => false);
-    if (!clicked) await page.keyboard.press("Escape").catch(() => {});
+      .catch(() => "none");
+    if (how === "none") await page.keyboard.press("Escape").catch(() => {});
     for (let k = 0; k < 8 && (await settingsPaneOpen()); k++) await page.waitForTimeout(150);
+  }
+  if (await settingsPaneOpen()) {
+    throw new FlowError(
+      "Could not close the composer settings popover.",
+      "While it is open Flow ignores the send button. Nothing was sent or charged.",
+    );
   }
 }
 
