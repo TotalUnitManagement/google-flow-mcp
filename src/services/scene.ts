@@ -89,8 +89,18 @@ export async function exportScene(
   let detail = "";
   if (d) {
     via = "download";
-    const tmp = await d.path().catch(() => null);
-    if (tmp) buffer = await fs.readFile(tmp);
+    // saveAs works for blob: downloads (scene exports are built in the page);
+    // a path is only kept when the context accepts downloads.
+    let saveError = "";
+    const staged = `${target}.part`;
+    try {
+      await d.saveAs(staged);
+      buffer = await fs.readFile(staged);
+    } catch (err) {
+      saveError = (err as Error).message.split(/\r?\n/)[0];
+    } finally {
+      await fs.rm(staged, { force: true }).catch(() => undefined);
+    }
     if (!buffer) {
       // Playwright had no file for it (failed, or cancelled). An http(s) url can
       // still be fetched directly; a blob: url cannot leave the page.
@@ -106,7 +116,7 @@ export async function exportScene(
           return "unparsable";
         }
       })();
-      detail = ` Download: file "${d.suggestedFilename()}", url ${shape}, failure ${(await d.failure().catch(() => null)) ?? "none"}.`;
+      detail = ` Download: file "${d.suggestedFilename()}", url ${shape}, failure ${(await d.failure().catch(() => null)) ?? "none"}${saveError ? `, save error: ${saveError}` : ""}.`;
     }
   } else {
     buffer = Buffer.from(await pollForEncodedVideo(legacy, timeoutMs), "base64");

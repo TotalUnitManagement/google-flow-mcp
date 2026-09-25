@@ -49,6 +49,9 @@ async function connect(): Promise<BrowserContext> {
       headless: config.headless,
       channel: config.channel,
       viewport: { width: 1440, height: 900 },
+      // Scene exports arrive as in-page (blob:) downloads; without this Playwright
+      // reports the download but keeps no file.
+      acceptDownloads: true,
       args: ["--disable-blink-features=AutomationControlled"],
     });
     browser = null;
