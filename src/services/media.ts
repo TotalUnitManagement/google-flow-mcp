@@ -227,16 +227,26 @@ async function openVideoTile(key: string, stay = false): Promise<{ mediaId: stri
 export async function chooseOriginalSize(): Promise<void> {
   const page = await getFlowPage();
   const opened = await page.evaluate(() => {
-    const trigger = [...document.querySelectorAll<HTMLElement>('button[aria-label="Download media"]')].find(
+    // A picker or popover left open (e.g. by "Add clip") can hide the toolbar.
+    // Close it by its backdrop — never Escape, which exits the whole editor.
+    document.querySelector<HTMLElement>(".cdk-overlay-backdrop")?.click();
+    const visible = [...document.querySelectorAll<HTMLElement>("button")].filter(
       (b) => b.getClientRects().length > 0 && !b.closest(".cdk-overlay-container"),
     );
-    if (!trigger) return false;
+    const label = (b: HTMLElement) => (b.getAttribute("aria-label") ?? "").trim();
+    // Exact label first. The fallback accepts "Download media/scene/video" or
+    // "Export…", but NEVER a bare "Download": that is a history card's button and
+    // exports that one clip, not the scene.
+    const trigger =
+      visible.find((b) => label(b) === "Download media") ??
+      visible.find((b) => /^(download (media|scene|video)|export)/i.test(label(b)));
+    if (!trigger) return { ok: false, seen: [...new Set(visible.map(label).filter(Boolean))].slice(0, 40) };
     trigger.click();
-    return true;
+    return { ok: true, seen: [] as string[] };
   });
-  if (!opened) {
+  if (!opened.ok) {
     throw new FlowError(
-      'Could not find the editor\'s "Download media" menu.',
+      `Could not find the editor's "Download media" menu. Visible buttons: ${opened.seen.join(" | ") || "(none)"}`,
       "Flow's editor may have changed — see references/ui-playbook.md. Nothing was charged.",
     );
   }
