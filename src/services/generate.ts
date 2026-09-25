@@ -130,14 +130,18 @@ async function send(): Promise<void> {
   // An open settings popover swallows the send click (observed 2026-09-24).
   await closeSettings();
   const progressBefore = await progressTileCount();
-  const clicked = await page.evaluate(() => {
-    const btn = [...document.querySelectorAll<HTMLElement>('button[aria-label="Start generation"]')].find(
-      (b) => b.offsetParent !== null && !(b as HTMLButtonElement).disabled,
-    );
-    if (!btn) return false;
-    btn.click();
-    return true;
-  });
+  // A real pointer click (Playwright input at the button's position), not a DOM
+  // btn.click(): observed 2026-09-24, every send Flow accepted was a real mouse
+  // click, while scripted DOM clicks on the same button were ignored. Playwright
+  // checks the button is visible, enabled and not covered before it clicks, and
+  // throws without clicking otherwise, so this can never press twice.
+  const button = page.locator('button[aria-label="Start generation"]:visible:enabled').first();
+  const clicked =
+    (await button.count()) > 0 &&
+    (await button
+      .click({ timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false));
   if (!clicked) {
     const state = await page
       .evaluate(() => {
