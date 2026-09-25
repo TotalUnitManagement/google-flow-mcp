@@ -123,7 +123,7 @@ export async function exportScene(
       if (e.state === "completed") completedGuid = e.guid;
     });
     await cdp
-      .send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: dlDir, eventsEnabled: true })
+      .send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dlDir, eventsEnabled: true })
       .catch(() => undefined);
   }
 
@@ -142,11 +142,13 @@ export async function exportScene(
     let lastSize = -1;
     let stableFor = 0;
     for (let i = 0; i < 240; i++) {
-      if (completedGuid) {
-        const done = await fs.readFile(path.join(dlDir, completedGuid)).catch(() => null);
-        if (done) return done;
-      }
       const names = await fs.readdir(dlDir).catch(() => [] as string[]);
+      // "allow" saves under the suggested name; "allowAndName" under the guid.
+      const finished = names.find((n) => !n.endsWith(".crdownload") && (n === completedGuid || /\.mp4$/i.test(n)));
+      if (finished) {
+        const done = await fs.readFile(path.join(dlDir, finished)).catch(() => null);
+        if (done && isCompleteMp4(done)) return done;
+      }
       const partial = names.find((n) => n.endsWith(".crdownload"));
       if (partial) {
         const size = (await fs.stat(path.join(dlDir, partial)).catch(() => null))?.size ?? -1;
