@@ -78,12 +78,96 @@ export async function exportScene(
     )
     .catch(() => null);
 
+  // Flow stitches the scene in the page and downloads it from a blob: url via a
+  // short-lived page, which is gone before Playwright can save it ("Target page,
+  // context or browser has been closed"). Keep a reference to any video-sized
+  // Blob the page turns into an object url, so its bytes can be read directly.
+  await page.evaluate(() => {
+    const w = window as unknown as { __flowBlobs?: Blob[]; __flowBlobHook?: boolean };
+    w.__flowBlobs = [];
+    if (w.__flowBlobHook) return;
+    const original = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = (obj: Blob | MediaSource) => {
+      if (obj instanceof Blob && (obj.type.startsWith("video/") || obj.size > 50_000)) w.__flowBlobs?.push(obj);
+      return original(obj);
+    };
+    // The blob may be minted in a worker (live, the hook above saw nothing), and
+    // is usually revoked right after the download link is clicked. Fetch it at
+    // the click, synchronously kicked off, so it is read before revocation.
+    const click = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+      if (this.href.startsWith("blob:")) {
+        fetch(this.href)
+          .then((r) => r.blob())
+          .then((b) => w.__flowBlobs?.push(b))
+          .catch(() => undefined);
+      }
+      return click.call(this);
+    };
+    w.__flowBlobHook = true;
+  });
+
+  // Most reliable of all: have Chrome itself write the download into a
+  // server-owned folder, however the page produced it (worker blob, short-lived
+  // page). Chrome names the file by download guid and reports completion.
+  const dlDir = path.join(config.stateDir, "downloads");
+  await fs.rm(dlDir, { recursive: true, force: true }).catch(() => undefined);
+  await fs.mkdir(dlDir, { recursive: true });
+  let completedGuid: string | null = null;
+  const cdp = await page
+    .context()
+    .newCDPSession(page)
+    .catch(() => null);
+  if (cdp) {
+    cdp.on("Browser.downloadProgress", (e: { guid: string; state: string }) => {
+      if (e.state === "completed") completedGuid = e.guid;
+    });
+    await cdp
+      .send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: dlDir, eventsEnabled: true })
+      .catch(() => undefined);
+  }
+
   await clickDownloadScene();
 
   const target = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
   await fs.mkdir(path.dirname(target), { recursive: true });
 
   const d = await download;
+  // Wait for Chrome to finish writing it. Node timers, not page.waitForTimeout:
+  // live, the server's Chrome exited partway through a scene download (every
+  // page call then throws "Target page, context or browser has been closed"),
+  // yet the .crdownload on disk was already the complete, decodable scene.
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const onDisk = await (async () => {
+    let lastSize = -1;
+    let stableFor = 0;
+    for (let i = 0; i < 240; i++) {
+      if (completedGuid) {
+        const done = await fs.readFile(path.join(dlDir, completedGuid)).catch(() => null);
+        if (done) return done;
+      }
+      const names = await fs.readdir(dlDir).catch(() => [] as string[]);
+      const partial = names.find((n) => n.endsWith(".crdownload"));
+      if (partial) {
+        const size = (await fs.stat(path.join(dlDir, partial)).catch(() => null))?.size ?? -1;
+        stableFor = size > 0 && size === lastSize ? stableFor + 1 : 0;
+        lastSize = size;
+        // Unchanged for 3s and structurally complete: take it even if Chrome
+        // never renamed it.
+        if (stableFor >= 6) {
+          const bytes = await fs.readFile(path.join(dlDir, partial)).catch(() => null);
+          if (bytes && isCompleteMp4(bytes)) return bytes;
+        }
+      }
+      await sleep(500);
+    }
+    return null;
+  })();
+  if (onDisk && onDisk.length >= MIN_MEDIA_BYTES && isCompleteMp4(onDisk)) {
+    await fs.writeFile(target, onDisk);
+    await fs.rm(dlDir, { recursive: true, force: true }).catch(() => undefined);
+    return { file: target, bytes: onDisk.length, via: "download", sceneId: currentScene };
+  }
   let buffer: Buffer | null = null;
   let via: "download" | "legacy" = "legacy";
   let detail = "";
@@ -107,6 +191,26 @@ export async function exportScene(
       const u = d.url();
       if (/^https?:\/\//.test(u)) {
         buffer = Buffer.from(await (await fetch(u, { redirect: "follow" })).arrayBuffer());
+      } else {
+        const b64 = await page
+          .evaluate(async (blobUrl) => {
+            const w = window as unknown as { __flowBlobs?: Blob[] };
+            // The click hook's fetch may still be in flight; give it a moment.
+            for (let i = 0; i < 20 && !(w.__flowBlobs ?? []).length; i++) await new Promise((r) => setTimeout(r, 250));
+            let blob = [...(w.__flowBlobs ?? [])].sort((a, b) => b.size - a.size)[0];
+            if (!blob && blobUrl.startsWith("blob:")) {
+              blob = await fetch(blobUrl)
+                .then((r) => r.blob())
+                .catch(() => undefined as unknown as Blob);
+            }
+            if (!blob) return "";
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            let s = "";
+            for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+            return btoa(s);
+          }, u)
+          .catch(() => "");
+        if (b64) buffer = Buffer.from(b64, "base64");
       }
       const shape = (() => {
         try {
@@ -130,6 +234,36 @@ export async function exportScene(
   }
   await fs.writeFile(target, buffer);
   return { file: target, bytes: buffer.length, via, sceneId: currentScene };
+}
+
+/**
+ * Walk the MP4's top-level boxes: `ftyp` first, a `moov` present, and the last
+ * box ending exactly at the end of the buffer. A download cut off mid-write
+ * fails the last check, so an unrenamed .crdownload is only trusted when whole.
+ * @internal exported for unit tests
+ */
+export function isCompleteMp4(buf: Buffer): boolean {
+  let offset = 0;
+  let sawMoov = false;
+  let first = true;
+  while (offset + 8 <= buf.length) {
+    let size = buf.readUInt32BE(offset);
+    const type = buf.toString("latin1", offset + 4, offset + 8);
+    if (first && type !== "ftyp") return false;
+    first = false;
+    if (size === 1) {
+      if (offset + 16 > buf.length) return false;
+      const big = buf.readBigUInt64BE(offset + 8);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) return false;
+      size = Number(big);
+    } else if (size === 0) {
+      size = buf.length - offset; // box runs to end of file
+    }
+    if (size < 8 || offset + size > buf.length) return false;
+    if (type === "moov") sawMoov = true;
+    offset += size;
+  }
+  return sawMoov && offset === buf.length;
 }
 
 /**
